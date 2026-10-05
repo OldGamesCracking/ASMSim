@@ -1,0 +1,670 @@
+"""End-to-end tests for the deobfuscating simplifier.
+
+The real handlers from the snapshot are simplified and the result is executed in
+Unicorn side by side with the original: the outputs (EBX and whatever the
+terminator reads) and every memory byte outside the stub's private stack frame
+must be identical.  A pure-static invariant is checked as well: no kept
+instruction may read a register whose last writer was dropped.
+"""
+from pathlib import Path
+
+import pytest
+from iced_x86 import Code, Instruction, Mnemonic as MN, OpKind as OK, Register
+
+from asmsim import terms as T
+from asmsim import x86asm as asm
+from asmsim.deob import BytesSource, RemoteSource, analyse, arch_reads, simplify, slice_trace
+from asmsim.lift import State
+from asmsim.verify import verify
+
+FIXTURES = Path(__file__).parent / "fixtures"
+BASE = 0x1141000
+HANDLERS = {"handler1": 0x1141AE7, "handler2": 0x11435C8, "handler3": 0x114A3EA}
+
+
+@pytest.fixture(scope="module")
+def src():
+    return BytesSource((FIXTURES / "vmcode.bin").read_bytes(), BASE)
+
+
+@pytest.mark.parametrize("name,addr", sorted(HANDLERS.items()))
+def test_simplifies_and_verifies(src, name, addr):
+    res = simplify(src, addr, regs_in=["ebx"], regs_out=["ebx"])
+    assert res.trace.terminator is not None
+    assert res.trace.stop is None
+    assert res.stats["ins_kept"] < res.stats["ins_total"] / 2       # a lot must go
+    assert res.stats["dead_bytes"] > 0                              # the jmp-over-junk bytes
+    assert len(res.code) == res.end - res.start                     # in place
+    rep = verify(src, res, runs=40)
+    assert rep.ok, f"{name}: {rep}"
+
+
+@pytest.mark.parametrize("name,addr", sorted(HANDLERS.items()))
+def test_compact_mode_verifies(src, name, addr):
+    res = simplify(src, addr, regs_in=["ebx"], regs_out=["ebx"], mode="compact")
+    assert len(res.code) <= res.end - res.start
+    assert res.terminator_ip_out is not None
+    rep = verify(src, res, runs=25)
+    assert rep.ok, f"{name}: {rep}"
+
+
+@pytest.mark.parametrize("name,addr", sorted(HANDLERS.items()))
+def test_slice_invariant(src, name, addr):
+    """A kept instruction must never read a register/flags whose last writer was dropped."""
+    trace = analyse(src, addr)
+    slice_trace(trace, ["ebx"])
+    last: dict = {}
+    for step in trace.steps:
+        if step.kept:
+            reads, flags = arch_reads(step.ins)
+            for name_ in sorted(reads | flags):
+                if name_ in ("esp", "df"):
+                    continue
+                writer = last.get(name_)
+                assert writer is None or writer.kept, \
+                    f"{step.ip:#x} reads {name_} last written by dropped {writer.ip:#x}"
+        for name_ in step.writes | step.flag_writes:
+            last[name_] = step
+
+
+def _emitted_reads(ins):
+    """``arch_reads`` without the spurious input read of a self-xor."""
+    if ins.mnemonic == MN.XOR and ins.op_count == 2 and ins.op_kind(0) == OK.REGISTER \
+            and ins.op_kind(1) == OK.REGISTER and ins.op_register(0) == ins.op_register(1):
+        return frozenset(), frozenset()
+    regs, flags = arch_reads(ins)
+    return regs, flags
+
+
+@pytest.mark.parametrize("name,addr", sorted(HANDLERS.items()))
+def test_folded_output_reads_have_kept_writers(src, name, addr):
+    """The same invariant on the instructions the fold actually emits."""
+    res = simplify(src, addr, regs_in=["ebx"], regs_out=["ebx"])
+    last: dict = {}
+    for step in res.trace.steps:
+        if step.kept:
+            for ins in step.instrs():
+                reads, flags = _emitted_reads(ins)
+                for name_ in sorted(reads | flags):
+                    if name_ in ("esp", "df"):
+                        continue
+                    writer = last.get(name_)
+                    assert writer is None or writer.kept, \
+                        f"{ins} at {step.ip:#x} reads {name_} last written by dropped {writer.ip:#x}"
+        for name_ in step.writes | step.flag_writes:
+            last[name_] = step
+
+
+class _LoopbackClient:
+    """Stands in for an attached x64dbg-automate client (page-sized RPC chunks)."""
+
+    def __init__(self, data: bytes, base: int, running: bool = False, fail_writes: bool = False):
+        self.data = bytearray(data)
+        self.base, self.running, self.fail_writes = base, running, fail_writes
+        self.detached = False
+        self.reads: list[tuple[int, int]] = []
+        self.writes: list[tuple[int, bytes]] = []
+
+    def read_memory(self, addr: int, size: int) -> bytes:
+        off = addr - self.base
+        if off < 0 or off + size > len(self.data):
+            raise RuntimeError("unmapped")
+        self.reads.append((addr, size))
+        return bytes(self.data[off:off + size])
+
+    def write_memory(self, addr: int, data: bytes) -> bool:
+        if self.fail_writes:
+            return False
+        off = addr - self.base
+        if off < 0 or off + len(data) > len(self.data):
+            return False
+        self.data[off:off + len(data)] = data
+        self.writes.append((addr, bytes(data)))
+        return True
+
+    def is_running(self) -> bool:
+        return self.running
+
+    def detach_session(self) -> None:
+        self.detached = True
+
+
+def test_remote_source_reads_like_the_snapshot():
+    data = (FIXTURES / "vmcode.bin").read_bytes()
+    client = _LoopbackClient(data, BASE)
+    remote = RemoteSource(client)
+    snap = BytesSource(data, BASE)
+    assert remote.read(0x1141AE7, 16) == snap.read(0x1141AE7, 16)
+    assert remote.read(0x1141FFF, 0x1001) == snap.read(0x1141FFF, 0x1001)   # page crossing
+    assert len(client.reads) > 1                                            # split at the page edge
+    res = simplify(remote, 0x1141AE7, regs_in=["ebx"], regs_out=["ebx"])
+    assert res.stats["ins_kept"] < res.stats["ins_total"]
+    remote.close()
+    assert client.detached
+
+
+def test_patch_bytes_covers_the_whole_stub_and_verifies():
+    """The bytes written over a live stub: the code, NOP padded to start..end."""
+    data = (FIXTURES / "vmcode.bin").read_bytes()
+    for mode in ("inplace", "compact"):
+        res = simplify(BytesSource(data, BASE), 0x1141AE7, regs_in=["ebx"], regs_out=["ebx"],
+                       mode=mode)
+        patch = res.patch_bytes()
+        assert len(patch) == res.end - res.start          # no stale bytes left behind
+        assert patch.startswith(res.code)
+        assert set(patch[len(res.code):]) <= {0x90}       # the rest is NOPs
+        if mode == "inplace":
+            assert patch == res.code
+
+
+def test_live_patch_writes_the_blob_and_reads_it_back():
+    """Patching through a (fake, paused) x64dbg session replaces the stub in place."""
+    from tools.deob import patch_live
+
+    data = (FIXTURES / "vmcode.bin").read_bytes()
+    client = _LoopbackClient(data, BASE)
+    remote = RemoteSource(client)
+    res = simplify(remote, 0x1141AE7, regs_in=["ebx"], regs_out=["ebx"])
+    assert patch_live(remote, res) is None
+    off = res.start - BASE
+    assert bytes(client.data[off:off + len(res.patch_bytes())]) == res.patch_bytes()
+
+    # ... and it refuses while the target is running, or on a failed write
+    running = RemoteSource(_LoopbackClient(data, BASE, running=True))
+    assert "running" in patch_live(running, res)
+    broken = RemoteSource(_LoopbackClient(data, BASE, fail_writes=True))
+    assert "failed" in patch_live(broken, res)
+
+
+def test_concrete_input_registers_fold():
+    """A concrete RegsIn value is substituted, so the outputs become constants."""
+    data = (FIXTURES / "vmcode.bin").read_bytes()
+    snap = BytesSource(data, BASE)
+    res = simplify(snap, 0x1141AE7, regs_in={"ebx": 0x1000}, regs_out=["ebx"])
+    assert res.outputs["ebx"].op == "c"
+    assert res.outputs["ebx"].args[0] == 0x1000                 # EBX is passed through unchanged
+
+
+def test_patched_image_contains_the_simplified_stub(src):
+    """The inplace blob drops straight into the original image at the same address."""
+    res = simplify(src, 0x1141AE7, regs_in=["ebx"], regs_out=["ebx"])
+    image = bytearray(src.data)
+    off = 0x1141AE7 - BASE
+    image[off:off + len(res.code)] = res.code
+    patched = BytesSource(bytes(image), BASE)
+    assert patched.read(0x1141AE7, len(res.code)) == res.code
+    rep = verify(patched, res, runs=20)          # the patched image behaves like the original
+    assert rep.ok, str(rep)
+
+
+def test_inplace_dropped_bytes_are_nops(src):
+    res = simplify(src, 0x1141AE7, regs_in=["ebx"], regs_out=["ebx"])
+    covered = set()
+    for step in res.kept_steps:
+        covered.update(range(step.ip, step.region_end))
+    for i, byte in enumerate(res.code):
+        addr = res.start + i
+        if addr not in covered:
+            assert byte == 0x90, f"{addr:#x} was not kept and is not a NOP"
+
+
+# ===========================================================================================
+# run folding: chains of instructions that end in a literal
+# ===========================================================================================
+STUB_BASE = 0x400000
+
+
+def _stub(insns):
+    """Assemble a straight-line stub, padded to a full page so ``verify`` can read it."""
+    data = asm.encode(list(insns), STUB_BASE) + b"\x90" * 32
+    return BytesSource(data + b"\x90" * (0x1000 - len(data)), STUB_BASE)
+
+
+def _jmp(reg_name: str):
+    return Instruction.create_reg(Code.JMP_RM32, getattr(Register, reg_name.upper()))
+
+
+def test_constant_run_folds_to_a_literal():
+    """MOV EAX,1 / SHL EAX,2 -> MOV EAX,4 and MOV CL,0x22 / XOR CL,0x3A -> MOV CL,0x18."""
+    src = _stub([
+        asm.mov(asm.reg("eax"), asm.imm(1)),
+        asm.shift("shl", asm.reg("eax"), asm.imm(2)),
+        asm.mov(asm.reg("ecx", 8), asm.imm(0x22)),
+        asm.alu("xor", asm.reg("ecx", 8), asm.imm(0x3A)),
+        _jmp("eax"),
+    ])
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax", "ecx"])
+    assert res.code[:7] == bytes.fromhex("b804000000b118")
+    assert res.code[7:12] == b"\x90" * 5             # the rest of the run is padding
+    assert res.stats["absorbed"] == 3
+    assert res.stats["ins_kept"] == 2                # the folded run and the jmp
+    # a folded run is listed one instruction per line, each at its own address
+    folded = [l for l in res.listing().splitlines() if "mov eax, 4" in l or "mov cl, 0x18" in l]
+    assert len(folded) == 2
+    assert "mov cl" not in folded[0] and "mov eax" not in folded[1]
+    rep = verify(src, res, runs=25)
+    assert rep.ok, str(rep)
+
+
+def test_partial_writes_fold_to_their_register_view():
+    """A run that ends in a 16 bit / high byte literal is written back as such."""
+    src = _stub([
+        asm.mov(asm.reg("ecx", 16), asm.imm(1)),
+        asm.alu("or", asm.reg("ecx", 16), asm.imm(2)),
+        asm.mov(asm.reg("eax", "h"), asm.imm(0x10)),
+        asm.alu("xor", asm.reg("eax", "h"), asm.imm(1)),
+        _jmp("ebx"),
+    ])
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax", "ecx"])
+    listing = res.listing()
+    assert "mov cx, 3" in listing and "mov ah, 0x11" in listing
+    assert res.stats["absorbed"] == 3                # the run folds both registers at once
+    rep = verify(src, res, runs=25)
+    assert rep.ok, str(rep)
+
+
+def test_run_folds_when_a_later_instruction_overwrites_the_flags():
+    """The XOR's flags are dead (the ADD overwrites them), so the run may fold."""
+    src = _stub([
+        asm.mov(asm.reg("ecx", 8), asm.imm(0x22)),
+        asm.alu("xor", asm.reg("ecx", 8), asm.imm(0x3A)),
+        asm.alu("add", asm.reg("eax"), asm.imm(1)),
+        asm.setcc("e", asm.reg("ebx", 8)),           # reads ZF - from the ADD, not the XOR
+        _jmp("eax"),
+    ])
+    res = simplify(src, STUB_BASE, regs_in=["eax", "ebx"], regs_out=["eax", "ecx", "ebx"])
+    listing = res.listing()
+    assert "mov cl, 0x18" in listing
+    assert "add eax, 1" in listing and "set" in listing
+    rep = verify(src, res, runs=25)
+    assert rep.ok, str(rep)
+
+
+def test_run_stays_when_a_later_instruction_reads_its_flags():
+    """SETE BL reads the XOR's ZF: folding it away would change BL."""
+    src = _stub([
+        asm.mov(asm.reg("ecx", 8), asm.imm(0x22)),
+        asm.alu("xor", asm.reg("ecx", 8), asm.imm(0x3A)),
+        asm.setcc("e", asm.reg("ebx", 8)),
+        _jmp("eax"),
+    ])
+    res = simplify(src, STUB_BASE, regs_in=["eax", "ebx"], regs_out=["eax", "ecx", "ebx"])
+    assert "xor cl, 0x3a" in res.listing().lower()
+    rep = verify(src, res, runs=25)
+    assert rep.ok, str(rep)
+
+
+def _raw_stub(hexstr: str):
+    """A stub from hand written bytes (regression reproducers), NOP padded."""
+    data = bytes.fromhex(hexstr) + b"\x90" * 16
+    return BytesSource(data + b"\x90" * (0x1000 - len(data)), STUB_BASE)
+
+
+def _assert_regions_do_not_overlap(res):
+    spans = sorted((s.ip, s.region_end) for s in res.kept_steps)
+    for (lo, hi), (lo2, _hi2) in zip(spans, spans[1:]):
+        assert hi <= lo2, f"a folded run overlaps the next step: {lo:#x}..{hi:#x} / {lo2:#x}"
+
+
+def test_step_dropped_inside_a_run_cannot_come_back():
+    """``dec esi`` is dead while the run folds, but live again afterwards; it has
+    to stay absorbed - re-keeping it would overwrite the replacement bytes."""
+    hexs = ("89c666be85c4"    # mov esi,eax ; mov si,0xc485
+            "6683c15f"        # add cx,0x5f
+            "685d560000"      # push 0x565d
+            "b122"            # mov cl,0x22
+            "ffce"            # dec esi          <- dropped, then live again
+            "be02000000"      # mov esi,2
+            "b410"            # mov ah,0x10
+            "b510"            # mov ch,0x10
+            "6878563412"      # push 0x12345678
+            "ffe3")           # jmp ebx
+    src = _raw_stub(hexs)
+    res = simplify(src, STUB_BASE, regs_in=["ebx"],
+                   regs_out=["eax", "ecx", "edx", "ebx", "esi", "edi", "ebp"])
+    _assert_regions_do_not_overlap(res)
+    rep = verify(src, res, runs=20)
+    assert rep.ok, str(rep)
+
+
+def test_partial_write_keeps_the_producer_of_the_bits_it_merges():
+    """``mov bl, 0`` keeps ebx's upper bits, so ``mov ebx, ebp`` - the producer of
+    the value they merge into - has to stay in the output."""
+    hexs = ("6a7f6a7f"        # push 0x7f ; push 0x7f
+            "89eb"            # mov ebx,ebp       <- must survive the fold of "sete bl"
+            "b122"            # mov cl,0x22
+            "6683e93f"        # sub cx,0x3f
+            "0f94c3"          # sete bl
+            "89f1"            # mov ecx,esi
+            "80c2ff"          # add dl,0xff
+            "66be6ea9"        # mov si,0xa96e
+            "80c101"          # add cl,1
+            "ffe6")           # jmp esi
+    src = _raw_stub(hexs)
+    res = simplify(src, STUB_BASE, regs_in=["ebp"],
+                   regs_out=["eax", "ecx", "edx", "ebx", "esi", "edi"])
+    assert "mov ebx, ebp" in res.listing()
+    _assert_regions_do_not_overlap(res)
+    rep = verify(src, res, runs=20)
+    assert rep.ok, str(rep)
+
+
+def test_a_store_a_surviving_load_reads_stays():
+    """``pop esi`` reads [esp] back at runtime: the spill it forwards from must stay
+    in the output even though ESI's *symbolic* value does not change."""
+    hexs = ("89edb122"        # mov ebp,ebp ; mov cl,0x22
+            "893424"          # mov [esp],esi   <- re-read by the pop below
+            "0f95c3"          # setne bl
+            "5e"              # pop esi
+            "21de80c318"      # and esi,ebx ; add bl,0x18
+            "6683f257"        # xor dx,0x57
+            "6a7f"            # push 0x7f        <- overwrites the same slot
+            "f7d2"            # not edx
+            "66bddba9"        # mov bp,0xa9db
+            "891dfcffffff"    # mov [0xfffffffc],ebx
+            "ffe6")           # jmp esi
+    src = _raw_stub(hexs)
+    outs = ["eax", "ecx", "edx", "ebx", "esi", "edi", "ebp"]
+    res = simplify(src, STUB_BASE, regs_in=[], regs_out=outs)
+    assert "mov [esp], esi" in res.listing()
+    _assert_regions_do_not_overlap(res)
+    rep = verify(src, res, runs=25)
+    assert rep.ok, str(rep)
+
+    # ... and the switch really is the difference: without the protection the spill
+    # disappears (that is the unsound behaviour the option restores)
+    loose = simplify(src, STUB_BASE, regs_in=[], regs_out=outs, protect_loaded_stores=False)
+    assert "mov [esp], esi" not in loose.listing(show_dropped=False)
+    assert not verify(src, loose, runs=5).ok
+
+
+def test_loaded_store_protection_can_be_switched_off():
+    """protect_loaded_stores=False (``--unsafe-stores``) goes back to the code the
+    simplifier emitted before the fix."""
+    src = _stub([
+        asm.mov(asm.mem(asm.Mem(base="esp")), asm.imm(0x12345678)),
+        asm.push(asm.imm(0x22334455)),
+        asm.mov(asm.reg("eax"), asm.mem(asm.Mem(base="esp"))),
+        _jmp("eax"),
+    ])
+    on = simplify(src, STUB_BASE, regs_in=[], regs_out=["eax", "ecx"])
+    off = simplify(src, STUB_BASE, regs_in=[], regs_out=["eax", "ecx"],
+                   protect_loaded_stores=False)
+    assert on.stats["protect_loaded_stores"] is True
+    assert off.stats["protect_loaded_stores"] is False
+    assert "--unsafe-stores" in off.summary()
+    for res in (on, off):
+        assert verify(src, res, runs=15).ok, res.listing()
+
+
+def test_constant_stack_idiom_still_folds():
+    """The VM's ``sub esp,4 / mov [esp],imm / pop reg`` must still collapse into one
+    literal write even though the load now keeps its store alive."""
+    src = _stub([
+        asm.alu("sub", asm.reg("esp"), asm.imm(4)),
+        asm.mov(asm.mem(asm.Mem(base="esp")), asm.imm(0x45505948)),
+        Instruction.create_reg(Code.POP_R32, Register.EAX),
+        _jmp("eax"),
+    ])
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"])
+    assert res.stats["ins_kept"] == 2                # the folded run and the jmp
+    assert "mov eax, 0x45505948" in res.listing()
+    rep = verify(src, res, runs=15)
+    assert rep.ok, str(rep)
+
+
+# ===========================================================================================
+# stack arguments: --args arg0, arg1, ... at [esp+0], [esp+4], ...
+# ===========================================================================================
+def _arg_stub():
+    return _stub([
+        asm.mov(asm.reg("eax"), asm.mem(asm.Mem(base="esp"))),
+        asm.alu("add", asm.reg("eax"), asm.mem(asm.Mem(base="esp", disp=4))),
+        _jmp("eax"),
+    ])
+
+
+def test_stack_args_become_named_inputs():
+    res = simplify(_arg_stub(), STUB_BASE, regs_in=[], regs_out=["eax"],
+                   args=["arg0", "arg1"])
+    assert T.fmt(res.outputs["eax"], 8) == "add(in:arg0, in:arg1)"
+    assert "in:arg0" in res.listing()
+    assert res.stats["args"] == "[esp+0x0], [esp+0x4]"
+    assert res.concrete_args == {}
+    rep = verify(_arg_stub(), res, runs=20)
+    assert rep.ok, str(rep)
+
+
+def test_concrete_stack_args_fold_to_literals():
+    res = simplify(_arg_stub(), STUB_BASE, regs_in=[], regs_out=["eax"],
+                   args={"arg0": 0x10, "arg1": 2})
+    assert res.outputs["eax"].op == "c" and res.outputs["eax"].args[0] == 0x12
+    assert "mov eax, 0x12" in res.listing()
+    assert res.concrete_args == {0: 0x10, 4: 2}
+    rep = verify(_arg_stub(), res, runs=20)      # the verifier seeds both slots
+    assert rep.ok, str(rep)
+
+
+def test_a_store_to_an_arg_slot_wins():
+    """A declared argument must not shadow what the stub itself stored there."""
+    src = _stub([
+        asm.mov(asm.mem(asm.Mem(base="esp")), asm.imm(5)),
+        asm.mov(asm.reg("eax"), asm.mem(asm.Mem(base="esp"))),
+        _jmp("eax"),
+    ])
+    res = simplify(src, STUB_BASE, regs_in=[], regs_out=["eax"], args={"arg0": 0x11223344})
+    assert res.outputs["eax"].op == "c" and res.outputs["eax"].args[0] == 5
+    rep = verify(src, res, runs=15)
+    assert rep.ok, str(rep)
+
+
+def test_a_read_inside_an_arg_slot_is_a_slice_of_it():
+    src = _stub([
+        asm.movx("movzx", "eax", asm.mem(asm.Mem(base="esp", disp=1), 8)),
+        asm.movx("movzx", "ecx", asm.mem(asm.Mem(base="esp", disp=2), 16)),
+        _jmp("eax"),
+    ])
+    res = simplify(src, STUB_BASE, regs_in=[], regs_out=["eax", "ecx"],
+                   args={"arg0": 0xAABBCCDD})
+    assert res.outputs["eax"].args[0] == 0xCC          # byte 1 of the little endian dword
+    assert res.outputs["ecx"].args[0] == 0xAABB        # its high word
+    rep = verify(src, res, runs=15)
+    assert rep.ok, str(rep)
+
+
+def test_reads_outside_or_across_slots_stay_opaque():
+    src = _stub([asm.mov(asm.reg("eax"), asm.mem(asm.Mem(base="esp", disp=2))), _jmp("eax")])
+    res = simplify(src, STUB_BASE, regs_in=[], regs_out=["eax"], args=["arg0", "arg1"])
+    assert res.outputs["eax"].op == "load"             # spans arg0 and arg1
+
+    below = _stub([asm.mov(asm.reg("eax"), asm.mem(asm.Mem(base="esp", disp=-4))), _jmp("eax")])
+    res = simplify(below, STUB_BASE, regs_in=[], regs_out=["eax"], args=["arg0"])
+    assert res.outputs["eax"].op == "load"             # below the first slot
+
+
+def test_declared_but_unread_args_change_nothing():
+    src = _stub([asm.mov(asm.reg("eax"), asm.imm(7)), _jmp("eax")])
+    plain = simplify(src, STUB_BASE, regs_in=[], regs_out=["eax"])
+    withargs = simplify(src, STUB_BASE, regs_in=[], regs_out=["eax"], args=["arg0", "arg1"])
+    assert plain.code == withargs.code
+    assert withargs.stats["args"] == "[esp+0x0], [esp+0x4]"
+
+
+def test_a_terminator_reading_an_arg_slot_is_handled():
+    """``ret`` / ``jmp [esp]`` take the argument at [esp]: the name must not leak
+    into the compared registers (collecting the outputs used to raise a KeyError)."""
+    for hexs in ("ff2424",      # jmp dword ptr [esp]
+                 "c3"):         # ret
+        res = simplify(_raw_stub(hexs), STUB_BASE, regs_in=[], regs_out=["eax"], args=["arg0"])
+        assert res.trace.terminator is not None
+        assert "arg0" not in res.compare_regs
+        assert res.outputs["eax"].op == "in"
+
+
+def test_stack_argument_names_are_validated():
+    src = _stub([asm.mov(asm.reg("eax"), asm.imm(1)), _jmp("eax")])
+    for bad in (["eax"], ["arg"], ["argx"], ["0"], ["arg0", "arg00"]):
+        with pytest.raises(ValueError):
+            simplify(src, STUB_BASE, regs_in=[], regs_out=["eax"], args=bad)
+
+
+def test_argument_slots_survive_a_state_copy():
+    st = State.initial(args={0: T.inp("arg0", 32)})
+    assert st.mem.arg_slots == {0: T.inp("arg0", 32)}
+    assert st.copy().mem.arg_slots == st.mem.arg_slots
+
+
+def test_parse_regs_accepts_the_argument_syntax():
+    from tools.deob import parse_regs
+    assert parse_regs("arg0,arg1=0x1234") == {"arg0": None, "arg1": 0x1234}
+
+
+# ===========================================================================================
+# known memory contents (--mem address=value) and the instructions they unlock
+# ===========================================================================================
+DATA = 0x600100          # lazily mapped data, outside the code image
+
+
+def _branchy_stub():
+    """``mov al, [DATA] / cmp al, 7 / jne end / mov eax, 0x111 / end: jmp ebx``."""
+    head = [
+        asm.mov(asm.reg("eax", 8), asm.mem(asm.Mem(disp=DATA), 8)),
+        asm.alu("cmp", asm.reg("eax", 8), asm.imm(7), 8),
+    ]
+    size = sum(len(asm.encode([i], STUB_BASE)) for i in head)
+    jne = asm.jcc("ne", STUB_BASE + size + 5)        # past the "mov eax, 0x111"
+    return _stub(head + [jne, asm.mov(asm.reg("eax"), asm.imm(0x111)), _jmp("ebx")])
+
+
+def test_known_memory_resolves_a_data_dependent_branch():
+    src = _branchy_stub()
+    taken = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"], mem={DATA: 7})
+    assert taken.trace.stop is None                  # the branch became a plain jump
+    assert taken.outputs["eax"].op == "c" and taken.outputs["eax"].args[0] == 0x111
+    assert taken.stats["mem"] == f"[{DATA:#x}]=0x7"
+    assert verify(src, taken, runs=20).ok            # the verifier seeds the value
+
+    other = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"], mem={"0x600100": 9})
+    # the other edge: the branch is taken, only the loaded byte was written
+    assert other.outputs["eax"].op == "ins"
+    assert verify(src, other, runs=20).ok
+
+
+def test_several_memory_declarations_and_their_validation():
+    """--mem takes a comma separated list; neighbouring dwords are fine, overlapping
+    or repeated ones are not."""
+    src = _branchy_stub()
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"],
+                   mem={"0x600100": 7, "0x600104": 0x99})
+    assert res.stats["mem"] == "[0x600100]=0x7, [0x600104]=0x99"
+    assert res.concrete_mem == {0x600100: 7, 0x600104: 0x99}
+    assert verify(src, res, runs=15).ok
+
+    with pytest.raises(ValueError):                 # overlapping dwords
+        simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"],
+                 mem={"0x600100": 1, "0x600102": 2})
+    with pytest.raises(ValueError):                 # the same address listed twice
+        simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"],
+                 mem=["0x600100", "0x600100"])
+
+
+KEEP_STUB = ("8b0424"            # mov eax, [esp]          (arg0)
+             "83c001"            # add eax, 1        <- region
+             "eb03"              # jmp short +3      <- region
+             "909090"            # ...junk           <- region
+             "03442404"          # add eax, [esp+4]        (arg1)
+             "ffe3")             # jmp ebx
+KEEP_LO, KEEP_HI = STUB_BASE + 3, STUB_BASE + 0x0b
+
+
+def test_a_kept_region_is_emitted_verbatim():
+    src = _raw_stub(KEEP_STUB)
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"],
+                   args=["arg0", "arg1"], keep=[(KEEP_LO, KEEP_HI)])
+    # the region's trace ran (its `add eax, 1` is in the value) ...
+    assert T.fmt(res.outputs["eax"], 8) == "add(in:arg1, add(in:arg0, 1))"
+    # ... but its bytes - including the junk the jump skips - are untouched
+    assert res.code[3:0x0b] == bytes.fromhex("83c001" "eb03" "909090")
+    assert res.stats["keep"] == f"[{KEEP_LO:#x}-{KEEP_HI:#x}]"
+    listing = res.listing()
+    assert f"; --- kept verbatim {KEEP_LO:08X}..{KEEP_HI:08X} ---" in listing
+    assert "jmp short" in listing.lower()             # the region's own branch, verbatim
+    rep = verify(src, res, runs=20)
+    assert rep.ok, str(rep)
+
+
+def test_a_kept_region_also_works_compacted():
+    src = _raw_stub(KEEP_STUB)
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"],
+                   args=["arg0", "arg1"], keep=[(KEEP_LO, KEEP_HI)], mode="compact")
+    assert "jmp short" in res.listing().lower()
+    rep = verify(src, res, runs=20)
+    assert rep.ok, str(rep)
+
+
+def test_a_kept_region_branching_out_of_itself_is_refused_compacted():
+    """A compact blob moves code, so a branch that leaves its region cannot be kept."""
+    # mov eax, [esp] ; jmp short 0x400007 (out of the region) ; nop nop ; jmp ebx
+    src = _raw_stub("8b0424" + "eb02" + "9090" + "ffe3")
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"],
+                   keep=[(STUB_BASE + 3, STUB_BASE + 5)])          # inplace: fine
+    assert verify(src, res, runs=10).ok
+    with pytest.raises(ValueError):
+        simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"],
+                 keep=[(STUB_BASE + 3, STUB_BASE + 5)], mode="compact")
+
+
+def test_keep_region_validation():
+    src = _raw_stub(KEEP_STUB)
+    for bad in ("0x1",                      # not LO-HI
+                f"{STUB_BASE - 0x10:#x}-{STUB_BASE:#x}",            # starts before the stub
+                f"{KEEP_LO:#x}-{KEEP_LO + 2:#x},{KEEP_HI - 2:#x}-{KEEP_HI:#x}"):  # overlap
+        with pytest.raises(ValueError):
+            simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"], keep=bad)
+
+
+def test_lock_prefix_is_lifted_as_a_plain_instruction():
+    """One thread, no memory ordering: ``lock`` adds nothing to the model."""
+    src = _raw_stub("f001442408"                      # lock add dword [esp+8], eax
+                    "ffe3")                           # jmp ebx
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"])
+    assert res.trace.stop is None
+    assert "lock add" in res.listing()
+    rep = verify(src, res, runs=20)                   # the store is at [esp+8]: compared
+    assert rep.ok, str(rep)
+
+
+def test_rep_stosd_is_unrolled_into_stores():
+    """A constant count ``rep stos`` becomes the stores it performs; the instruction
+    itself stays in the output, so the blob keeps its shape."""
+    src = _raw_stub("8bfc"                            # mov edi, esp
+                    "b844332211"                      # mov eax, 0x11223344
+                    "b903000000"                      # mov ecx, 3
+                    "f3ab"                            # rep stosd
+                    "ffe3")                           # jmp ebx
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"])
+    stores = [s for s in res.trace.state.mem.stores]
+    assert [T.fmt(s.val) for s in stores] == ["0x11223344"] * 3
+    assert [T.fmt(s.addr, 3) for s in stores] == ["in:esp", "add(in:esp, 4)",
+                                                 "add(in:esp, 8)"]
+    assert "rep stosd" in res.listing()
+    rep = verify(src, res, runs=20)                   # the writes land at [esp..esp+12)
+    assert rep.ok, str(rep)
+
+
+def test_a_symbolic_rep_count_is_not_lifted():
+    """Without a known count the unrolled stores cannot be built - the analysis stops."""
+    src = _raw_stub("8bfc" + "b844332211" + "f3ab" + "ffe3")   # ecx never written
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"])
+    assert res.trace.stop is not None
+    assert "symbolic count" in res.trace.stop.why
+
+
+def test_computed_values_are_left_alone():
+    """Nothing to fold when the value is not a literal."""
+    src = _stub([asm.alu("add", asm.reg("eax"), asm.reg("ebx")), _jmp("eax")])
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"])
+    assert "add eax, ebx" in res.listing()
+    assert res.stats["absorbed"] == 0
+    rep = verify(src, res, runs=15)
+    assert rep.ok, str(rep)
