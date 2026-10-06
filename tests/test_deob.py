@@ -1002,6 +1002,20 @@ def test_a_stub_that_calls_backwards_still_verifies_compacted(src):
         assert rep.ok, f"{mode}: {rep}"
 
 
+def test_the_fixture_handlers_leave_no_dead_partial_writes(src):
+    """No ``mov cl, x`` left standing in front of a folded ``mov cl, y``.
+
+    0x114A8EB had exactly that: the two writes were separated by a *dropped* forward
+    jump (and other dead junk), which the fold walk refused to reach across.
+    """
+    for addr in (0x1141AE7, 0x11435C8, 0x114A3EA, BRANCHY, 0x114A8EB, 0x114C000):
+        for mode in ("inplace", "compact"):
+            res = simplify(src, addr, regs_in=["ebx"], regs_out=["ebx"], mode=mode)
+            if res.trace.stop is not None:
+                continue
+            assert _repeated_partial_writes(res) == [], f"{addr:#x} {mode}"
+
+
 def _repeated_partial_writes(res):
     """Consecutive emitted ``mov <8/16 bit view>, <literal>`` of the same view.
 

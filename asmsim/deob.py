@@ -51,6 +51,7 @@ simplified bytes against the Unicorn reference emulator.
 """
 from __future__ import annotations
 
+import bisect
 import dataclasses
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -1315,6 +1316,13 @@ def _fold_pass(trace: Trace, stats: dict, max_run: int = MAX_FOLD_RUN) -> int:
                 readers[id(src)] = (min(lo, k), max(hi, k))
     count = 0
     index = {id(s): k for k, s in enumerate(steps)}
+    kept_ips = sorted(s.ip for s in steps if s.kept)
+
+    def gap_clear(lo: int, hi: int) -> bool:
+        """No *kept* instruction sits in an address gap the run would NOP over."""
+        k = bisect.bisect_left(kept_ips, lo)
+        return k >= len(kept_ips) or kept_ips[k] >= hi
+
     i, n = 0, len(steps)
     while i < n:
         s = steps[i]
@@ -1336,7 +1344,7 @@ def _fold_pass(trace: Trace, stats: dict, max_run: int = MAX_FOLD_RUN) -> int:
                 # the run only ever follows the one continuation of the previous
                 # instruction: a step another edge reaches is a join, not a chain
                 nxt = steps[j].succs[0] if len(steps[j].succs) == 1 else None
-                if nxt is None or nxt.kind or nxt.absorbed or trace.in_keep(nxt.ip) \
+                if nxt is None or nxt.absorbed or trace.in_keep(nxt.ip) \
                         or not _is_fallthrough(nxt):
                     break
                 if len(nxt.preds) != 1 or nxt.preds[0] is not steps[j]:
@@ -1345,10 +1353,16 @@ def _fold_pass(trace: Trace, stats: dict, max_run: int = MAX_FOLD_RUN) -> int:
                 if k != j + 1:
                     break
                 if not nxt.kept:
-                    # dropped code in between: its bytes are NOPs and nothing live
-                    # depends on it, so the run may simply reach across it
+                    # dead code in between: its bytes are NOPs, nothing live depends
+                    # on it, so the run reaches across - unless it jumps over (or into)
+                    # *kept* code, which the NOP padding would wipe out
+                    if not gap_clear(nxt.end, nxt.succs[0].ip if nxt.succs else nxt.end) \
+                            or not gap_clear(steps[j].end, nxt.ip):
+                        break
                     j = k
                     continue
+                if nxt.kind:                  # a kept branch/terminator: never across
+                    break
                 if not win.add(nxt):
                     break
                 j = k
