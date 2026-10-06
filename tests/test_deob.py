@@ -1016,6 +1016,73 @@ def test_the_fixture_handlers_leave_no_dead_partial_writes(src):
             assert _repeated_partial_writes(res) == [], f"{addr:#x} {mode}"
 
 
+def test_a_stale_fold_is_replanned_when_its_registers_die(src):
+    """A folded host is re-planned when its result registers go dead later.
+
+    0x114A8EB emitted ``mov ebp, 0x69A315E6`` / ``mov esi, 0x69A315E6`` out of the
+    fold at 0x114AA0E: they were planned while the junk reading ebp/esi was still
+    around, and the next round dropped that junk - but the fold pass only ever
+    looked at hosts it had not rewritten yet, so the stale replacement stayed.
+    """
+    res = simplify(src, 0x114A8EB, regs_in=["ebx"])
+    text = _instructions_only(res)
+    assert "69a315e6" not in text.lower()
+    assert "ebp" not in text and "esi" not in text      # both registers are dead now
+
+
+def _add_zero_stub(flags_live: bool = False):
+    """``push eax / xor eax, eax / add [ecx], eax / pop eax`` - the "adds zero" filler."""
+    a = _Asm(STUB_BASE)
+    a.op(asm.push(asm.reg("eax")))
+    a.op(asm.alu("xor", asm.reg("eax"), asm.reg("eax")))
+    a.op(asm.alu("add", asm.mem(asm.Mem(base="ecx")), asm.reg("eax")))
+    a.op(Instruction.create_reg(Code.POP_R32, Register.EAX))
+    if flags_live:
+        a.op(asm.setcc("e", asm.reg("edx", 8)))      # reads the add's ZF
+    a.op(_jmp("ebx"))
+    return _estub(a.build())
+
+
+def test_a_store_that_adds_zero_is_dropped():
+    """``add [ecx], eax`` with eax = 0 writes back exactly the bytes it read.
+
+    The memory model proves that by term identity (the store's value *is* the term
+    the instruction loaded), so the store is left out of the state - and since its
+    flags are dead too, the whole ``push``/``xor``/``add``/``pop`` filler goes, the
+    push and pop with it.  Verification compares memory by *content*, so the
+    dropped (byte-identical) write is not a difference.
+    """
+    src = _add_zero_stub()
+    res = simplify(src, STUB_BASE, regs_in=["eax", "ecx", "ebx"], regs_out=[])
+    assert res.stats["idem_stores"] == 1
+    assert [s.ins.mnemonic for s in res.kept_steps] == [MN.JMP]
+    rep = verify(src, res, runs=25)
+    assert rep.ok, str(rep)
+
+
+def test_a_store_that_adds_zero_stays_when_its_flags_are_live():
+    """The same filler with a ``sete`` behind it: the store may go, the flags may not.
+
+    ``add [ecx], 0`` leaves the flags of ``[ecx] + 0`` - not those of the ``xor`` -
+    so when something reads one of them the instruction has to stay (and still
+    writes back the value it read).
+    """
+    src = _add_zero_stub(flags_live=True)
+    res = simplify(src, STUB_BASE, regs_in=["eax", "ecx", "ebx"], regs_out=["edx"])
+    assert res.stats["idem_stores"] == 1
+    assert "add [ecx], eax" in _instructions_only(res)
+    rep = verify(src, res, runs=25)
+    assert rep.ok, str(rep)
+
+
+def test_the_fixture_add_zero_filler_is_gone(src):
+    """0x114A8EB's ``push eax / xor eax, eax / add [ecx], eax / pop eax`` (0x114AA42)."""
+    res = simplify(src, 0x114A8EB, regs_in=["ebx"])
+    assert res.stats["idem_stores"] >= 1
+    kept = {s.ip for s in res.kept_steps}
+    assert not kept & {0x114AA42, 0x114AA43, 0x114AA67, 0x114AA72}
+
+
 def _repeated_partial_writes(res):
     """Consecutive emitted ``mov <8/16 bit view>, <literal>`` of the same view.
 

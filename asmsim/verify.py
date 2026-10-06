@@ -10,9 +10,12 @@ What is compared:
 
 * every register in ``regs_out`` plus everything the terminating instruction
   reads (``jmp eax`` -> eax, ``ret`` -> esp),
-* every memory byte written outside the stub's own new stack frame (memory below
-  the entry ESP is the stub's private frame; that is the one assumption the
-  simplifier's dead-store analysis makes).
+* the content of every memory byte outside the stub's own new stack frame that
+  either run wrote (memory below the entry ESP is the stub's private frame; that is
+  the one assumption the simplifier's dead-store analysis makes).  Bytes are
+  compared by *value*, not by whether they were written at all: a store that writes
+  back the value that is already there is not observable, so dropping it (or
+  keeping it) must not look like a difference.
 
 A stub with several exits is verified per exit: each run stops at whichever exit
 it reaches and the two programs must agree on *which* exit that was, on the
@@ -178,10 +181,18 @@ def verify(src, res: Result, runs: int = 100, seed0: int = 0x5EED,
                 esp0 = regs["esp"]
                 wa = {ad: v for ad, v in a.written_bytes().items() if ad >= esp0}
                 wb = {ad: v for ad, v in b.written_bytes().items() if ad >= esp0}
+                # The *content* has to agree on every byte either program wrote - not
+                # the set of addresses itself.  A store that writes back the value
+                # that is already there changes no byte, so dropping (or keeping) one
+                # is not observable and must not look like a difference; a dropped
+                # store that *did* change something still shows up here, because the
+                # original's value is read back from the simplified run's memory.
                 for addr in sorted(set(wa) | set(wb)):
-                    if wa.get(addr) != wb.get(addr):
-                        mismatches.append(f"mem[{addr:#x}]: original {wa.get(addr)} != "
-                                          f"simplified {wb.get(addr)} ({where})")
+                    va = wa.get(addr) if addr in wa else a.read(addr, 1)[0]
+                    vb = wb.get(addr) if addr in wb else b.read(addr, 1)[0]
+                    if va != vb:
+                        mismatches.append(f"mem[{addr:#x}]: original {va} != "
+                                          f"simplified {vb} ({where})")
     finally:
         a.close()
         b.close()

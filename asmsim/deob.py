@@ -219,6 +219,7 @@ class Step:
     flag_reads: frozenset[str] = frozenset()
     loads: tuple[Load, ...] = ()
     stores: tuple[Store, ...] = ()
+    idem_stores: int = 0              # stores dropped for rewriting the bytes already there
     values: dict = dataclasses.field(default_factory=dict)   # written reg/flag -> new term
     pre: dict = dataclasses.field(default_factory=dict)      # written reg -> value before the step
     kind: str = ""                    # "" | "noop-jump" | "term"
@@ -645,6 +646,24 @@ def _region_touched(members, specs):
     return regs, flags
 
 
+def _idempotent_stores(stores, loads, ins) -> list:
+    """Stores that write back exactly the value this same instruction loaded.
+
+    ``add [ecx], eax`` with eax = 0 is one of the fixture's favourite fillers: the
+    term it stores *is* the term the instruction read a moment earlier (the memory
+    model forwards the load, so the identity is exact), which means the bytes in
+    memory do not change.  Such a store can be left out of the memory state - a
+    later load forwards to the older chain and sees the same bytes.  A
+    ``lock``-prefixed instruction is left alone: there the write is also a
+    synchronisation point, not just a value.
+    """
+    if not stores or not loads or getattr(ins, "has_lock_prefix", False):
+        return []
+    return [s for s in stores
+            if any(l.seg == s.seg and l.nbytes == s.size and l.addr is s.addr
+                   and l.term is s.val for l in loads)]
+
+
 def _lift_one(st, lifter, ins, ip, raw, memo):
     """Apply one instruction to ``st``; return the pieces a Step is built from."""
     pre_regs, pre_flags = dict(st.regs), dict(st.flags)
@@ -657,7 +676,8 @@ def _lift_one(st, lifter, ins, ip, raw, memo):
         _loads.append(Load(seg, addr, nbytes, t, may))
         return t
 
-    n_stores = len(st.mem.stores)
+    mem = st.mem
+    n_stores = len(mem.stores)
     st.mem.load = recording_load
     try:
         flow = lifter.step(ins)
@@ -666,7 +686,13 @@ def _lift_one(st, lifter, ins, ip, raw, memo):
 
     writes = frozenset(n for n in REG32 if st.regs[n] is not pre_regs[n])
     fwrites = frozenset(n for n in FLAGS if st.flags[n] is not pre_flags[n])
-    new_stores = tuple(st.mem.stores[n_stores:])
+    new_stores = tuple(mem.stores[n_stores:])
+    idem = _idempotent_stores(new_stores, loads, ins)
+    for s in idem:
+        mem.stores.remove(s)                # no byte changes: keep it out of the state
+    if idem:
+        gone = {id(s) for s in idem}
+        new_stores = tuple(s for s in new_stores if id(s) not in gone)
 
     roots = [st.regs[n] for n in writes] + [st.flags[n] for n in fwrites]
     for s in new_stores:
@@ -677,7 +703,7 @@ def _lift_one(st, lifter, ins, ip, raw, memo):
     reads |= areads
     flag_reads |= aflags
     return (flow, pre_regs, pre_flags, writes, fwrites, tuple(loads), new_stores,
-            reads, flag_reads)
+            reads, flag_reads, len(idem))
 
 
 # ===========================================================================================
@@ -738,13 +764,14 @@ def _analyse_linear(src, start: int, is_end: Callable[[Instruction], bool] = is_
 
         try:
             (flow, pre_regs, pre_flags, writes, fwrites, loads, new_stores, reads,
-             flag_reads) = _lift_one(st, lifter, ins, ip, raw, memo)
+             flag_reads, idem_stores) = _lift_one(st, lifter, ins, ip, raw, memo)
         except Unsupported as e:
             stop = AnalysisStop(ip, f"unsupported instruction: {e.ins} ({e.why or 'no semantics'})")
             break
 
         step = Step(ins=ins, ip=ip, raw=raw, flow=flow, writes=writes, flag_writes=fwrites,
                     reads=reads, flag_reads=flag_reads, loads=loads, stores=new_stores,
+                    idem_stores=idem_stores,
                     values={n: st.regs[n] for n in writes} | {f: st.flags[f] for f in fwrites},
                     pre={n: pre_regs[n] for n in writes},
                     esp_off=stack_offset(st.regs["esp"]),
@@ -993,11 +1020,12 @@ def _analyse_cfg(src, cfg: _Cfg, is_end, *, concrete, args, mem, max_instruction
         lifter = Lifter(st)
         try:
             (flow, pre_regs, pre_flags, writes, fwrites, loads, new_stores, reads,
-             flag_reads) = _lift_one(st, lifter, ins, node, raw, memo)
+             flag_reads, idem_stores) = _lift_one(st, lifter, ins, node, raw, memo)
         except Unsupported:
             raise _Fallback("unsupported instruction")
         step = Step(ins=ins, ip=node, raw=raw, flow=flow, writes=writes, flag_writes=fwrites,
                     reads=reads, flag_reads=flag_reads, loads=loads, stores=new_stores,
+                    idem_stores=idem_stores,
                     values={n: st.regs[n] for n in writes} | {f: st.flags[f] for f in fwrites},
                     pre={n: pre_regs[n] for n in writes},
                     esp_off=stack_offset(st.regs["esp"]),
@@ -1142,6 +1170,8 @@ def slice_trace(trace: Trace, regs_out: Sequence[str], keep_unread_stores: bool 
             keep = True                    # a terminator, a live branch, a loop region
         elif step.absorbed:
             keep = False                   # its effect is already in an earlier step's rewrite
+        elif step.esp_dropped and not step.force_keep:
+            keep = False                   # the stack pass proved this dance is invisible
         else:
             keep = (step.force_keep or bool(step.writes & live_regs)
                     or bool(step.flag_writes & live_flags)
@@ -1175,6 +1205,8 @@ def slice_trace(trace: Trace, regs_out: Sequence[str], keep_unread_stores: bool 
                 bits.append("flags " + ",".join(sorted(step.flag_writes)))
             if step.stores:
                 bits.append(f"{len(step.stores)} store(s)")
+            if step.idem_stores:
+                bits.append(f"{step.idem_stores} idempotent store(s)")
             if step.kind == "jump":
                 bits.append("jump to next instruction")
             step.reason = "dead (" + ("; ".join(bits) or "no effect") + ")"
@@ -1326,11 +1358,25 @@ def _fold_pass(trace: Trace, stats: dict, max_run: int = MAX_FOLD_RUN) -> int:
     i, n = 0, len(steps)
     while i < n:
         s = steps[i]
-        if (not s.kept or s.absorbed or s.kind or s.repl is not None
-                or not _is_fallthrough(s)):
+        if not s.kept or s.absorbed or s.kind or not _is_fallthrough(s):
             i += 1
             continue
         if trace.in_keep(s.ip):               # a verbatim region is nobody's to rewrite
+            i += 1
+            continue
+        if s.repl is not None:
+            # Folded on an earlier round, when more registers were still live (the
+            # junk that read them has been dropped since).  Re-plan the same span:
+            # the host carries the run's values, so it can be tightened here.  Only
+            # a strictly smaller replacement is installed - that is what makes the
+            # iteration terminate.
+            win = _Run(steps, i, live_stores, required, readers)
+            if win.add(s):
+                plan = win.plan(i)
+                if plan is not None:
+                    insns = [x for p in plan for x in p[2]]
+                    if len(insns) < len(s.repl) and _install(trace, i, i, plan):
+                        count += 1
             i += 1
             continue
         win = _Run(steps, i, live_stores, required, readers)
@@ -1455,15 +1501,23 @@ def _install(trace: Trace, i: int, j: int, plan: list) -> bool:
     steps = trace.steps
     host = steps[i]
     insns = [i for p in plan for i in p[2]]
-    if insns and j == i and _encode_instrs(insns, host.ip) == _encode_instr(host.ins, host.ip):
-        return False                            # same bytes: not worth a rewrite
+    if insns and j == i:
+        # a re-plan has to be compared against the *whole* current replacement, not
+        # just its first instruction - otherwise it re-installs itself forever
+        old = host.repl if host.repl is not None else [host.ins]
+        if _encode_instrs(insns, host.ip) == _encode_instrs(old, host.ip):
+            return False                        # same bytes: not worth a rewrite
     note = (f"folded into the run at {host.ip:#x}" if insns
             else "dead run (nothing outside it reads its result)")
     if insns:
-        host.orig = host.ins
+        if host.orig is None:                   # a re-plan keeps the original for the listing
+            host.orig = host.ins
         host.repl = insns
         host.ins = insns[0]
-        host.fill_end = steps[j].end
+        # the bytes the host owns end where the run's *last* member does - a re-plan
+        # of an already folded host must not shrink that back to its own instruction
+        host.fill_end = max(host.fill_end or 0, steps[j].end)
+        host.esp_off = steps[j].esp_off         # ... and so does the stack it leaves
         host.rewritten = True
         host.writes = frozenset(p[0] for p in plan)
         host.values = {p[0]: p[1] for p in plan}
@@ -1488,6 +1542,7 @@ def _install(trace: Trace, i: int, j: int, plan: list) -> bool:
             continue
         s.kept = False                          # NOPs in place, gone in compact mode
         s.absorbed = True
+        s.esp_dropped = False                   # the host owns the bytes now
         s.reason = note
         s.writes = s.flag_writes = s.reads = s.flag_reads = frozenset()
         s.stores = s.loads = ()
@@ -1501,37 +1556,53 @@ def _drop_esp_runs(trace: Trace, stats: dict) -> int:
     ``push reg / ... / pop reg``; once the payload is dead those runs touch
     nothing but a dead stack slot, and because their net ESP change is zero (and
     no surviving store/load lives inside) removing them is invisible.
+
+    The verdict is remembered in ``Step.esp_dropped`` and honoured by the slice -
+    the backward liveness on its own would keep a plain ``push reg``/``pop reg``
+    pair alive for its ESP writes and the two passes would undo each other on
+    every round.  A labelled run is re-checked here each round, so liveness that
+    grew around it releases the label again.
     """
     live_stores = stats["_live_stores"]
-    kept = [s for s in trace.order if s.kept]
-    removed = 0
+    chain = [s for s in trace.order if (s.kept or s.esp_dropped) and not s.absorbed]
+    changed = 0
     run: list[Step] = []
 
     def flush():
-        nonlocal removed
-        if run and run[0].esp_off_before is not None and run[-1].esp_off is not None \
-                and run[0].esp_off_before == run[-1].esp_off:
-            for s in run:
+        nonlocal changed
+        if not run:
+            return
+        dance = (run[0].esp_off_before is not None and run[-1].esp_off is not None
+                 and run[0].esp_off_before == run[-1].esp_off)
+        for s in run:
+            if dance:
+                if not s.esp_dropped:
+                    changed += 1
                 s.kept = False
                 s.esp_dropped = True
                 s.reason = "stack pointer dance (net ESP change 0, nothing live)"
-            removed += len(run)
+            elif s.esp_dropped:
+                s.esp_dropped = False       # no longer invisible: the slice re-decides
+                changed += 1
         run.clear()
 
-    for s in kept:
+    for s in chain:
         essential = (bool((s.writes - {"esp"}) & s.live_regs_after)
                      or bool(s.flag_writes & s.live_flags_after)
                      or any(id(x) in live_stores for x in s.stores)
-                     or bool(s.kind) or not _is_fallthrough(s))
+                     or bool(s.kind) or s.force_keep or not _is_fallthrough(s))
         if run and not (len(s.preds) == 1 and s.preds[0] is run[-1]
                         and _is_fallthrough(run[-1])):
             flush()                             # not the continuation of the dance
         if essential or s.esp_off is None or s.esp_off_before is None:
             flush()
+            if s.esp_dropped:                   # a stale label: something reads it now
+                s.esp_dropped = False
+                changed += 1
         else:
             run.append(s)
     flush()
-    return removed
+    return changed
 
 
 def _emitted_ips(trace: Trace) -> list[int]:
@@ -1953,6 +2024,8 @@ class Result:
         if s["dead_bytes"]:
             lines.append(f"  dead bytes skipped by jumps: {s['dead_bytes']}")
         lines.append(f"  memory stores: {s['stores_kept']} kept, {s['stores_dropped']} removed")
+        if s.get("idem_stores"):
+            lines.append(f"  stores that write back the value they just read: {s['idem_stores']}")
         if not s.get("protect_loaded_stores", True):
             lines.append("  !! --unsafe-stores: a surviving load may read a store that "
                          "was dropped")
@@ -2149,6 +2222,7 @@ def simplify(source, start: int, regs_in=(), regs_out=(), is_end: Callable | Non
     stats["folded"] = sum(1 for s in trace.steps if s.kept and s.rewritten)
     stats["absorbed"] = sum(1 for s in trace.steps if s.absorbed)
     stats["esp_runs"] = sum(1 for s in trace.steps if not s.kept and s.esp_dropped)
+    stats["idem_stores"] = sum(s.idem_stores for s in trace.steps)
     stats["protect_loaded_stores"] = protect_loaded_stores
     if arg_slots:
         stats["args"] = ", ".join(f"[esp+{off:#x}]" + (f"={t.val:#x}" if t.op == "c" else "")

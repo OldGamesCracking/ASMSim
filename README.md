@@ -22,10 +22,13 @@ Since it's the dawn of Artificial Intelligence, why not throw a few million toke
   simplified.
 * **Slicing**: backward liveness from the outputs you name plus whatever the terminating
   instruction reads and every observable memory write; runs of instructions that only
-  compute a literal collapse into that literal.
+  compute a literal collapse into that literal. A store that writes back exactly the
+  bytes it just read (`add [ecx], 0`, and the `push`/`xor`/`add`/`pop` filler around it)
+  writes nothing observable and is dropped.
 * **Verification**: original and simplified blob run side by side in Unicorn from
   identical randomised states (deterministic memory *and* a deterministic `rdtsc`),
-  compared per exit, with a report of which exits were exercised.
+  compared per exit, with a report of which exits were exercised. Memory is compared by
+  content, so dropping a byte-identical store is not reported as a difference.
 * **Output modes**: `inplace` (same addresses, dropped bytes become NOPs - patchable
   into the original image or a live process) and `compact` (survivors only, branches
   relaid out).
