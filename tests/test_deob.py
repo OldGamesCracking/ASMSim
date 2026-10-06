@@ -6,15 +6,18 @@ terminator reads) and every memory byte outside the stub's private stack frame
 must be identical.  A pure-static invariant is checked as well: no kept
 instruction may read a register whose last writer was dropped.
 """
+import random
 from pathlib import Path
 
 import pytest
-from iced_x86 import Code, Instruction, Mnemonic as MN, OpKind as OK, Register
+from iced_x86 import Code, Encoder, Instruction, Mnemonic as MN, OpKind as OK, Register
 
 from asmsim import terms as T
 from asmsim import x86asm as asm
-from asmsim.deob import BytesSource, RemoteSource, analyse, arch_reads, simplify, slice_trace
-from asmsim.lift import State
+from asmsim.deob import (BytesSource, RemoteSource, StubError, analyse, arch_reads, simplify,
+                         slice_trace)
+from asmsim.emu import Emu, REGS, random_regs
+from asmsim.lift import FLAGS, REG32, State
 from asmsim.verify import verify
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -668,3 +671,345 @@ def test_computed_values_are_left_alone():
     assert res.stats["absorbed"] == 0
     rep = verify(src, res, runs=15)
     assert rep.ok, str(rep)
+
+
+# ===========================================================================================
+# conditional branches: synthetic shapes
+# ===========================================================================================
+class _Asm:
+    """A tiny assembler with labels.  Branches are always the near form (fixed size),
+    so one sizing pass gives exact addresses and nothing is relaxed afterwards."""
+
+    def __init__(self, base: int, data: bytes = b""):
+        self.base = base
+        self.parts: list = []
+        self.data = data
+
+    def label(self, name: str) -> "_Asm":
+        self.parts.append(("label", name))
+        return self
+
+    def op(self, *instrs) -> "_Asm":
+        self.parts.append(("ins", list(instrs)))
+        return self
+
+    def jcc(self, cc: str, label: str) -> "_Asm":
+        self.parts.append(("jcc", (cc, label)))
+        return self
+
+    def jmp(self, label: str) -> "_Asm":
+        self.parts.append(("jmp", label))
+        return self
+
+    @staticmethod
+    def _enc(ins, ip: int) -> bytes:
+        enc = Encoder(32)
+        enc.encode(ins, ip)
+        return bytes(enc.take_buffer())
+
+    def _length(self, ins, ip: int) -> int:
+        return len(self._enc(ins, ip))
+
+    def build(self) -> bytes:
+        addr: dict[str, int] = {}
+        ip = self.base
+        for kind, payload in self.parts:
+            if kind == "label":
+                addr[payload] = ip
+            elif kind == "ins":
+                for ins in payload:
+                    ip += self._length(ins, ip)
+            else:
+                ip += 6 if kind == "jcc" else 5
+        out, ip = bytearray(), self.base
+        for kind, payload in self.parts:
+            if kind == "label":
+                continue
+            if kind == "ins":
+                for ins in payload:
+                    out += self._enc(ins, ip)
+                    ip += self._length(ins, ip)
+            elif kind == "jcc":
+                cc, label = payload
+                out += self._enc(asm.jcc(cc, addr[label]), ip)
+                ip += 6
+            else:
+                out += self._enc(asm.jmp(addr[payload]), ip)
+                ip += 5
+        return bytes(out)
+
+
+def _estub(code: bytes, base: int = STUB_BASE):
+    data = code + b"\x90" * 16
+    return BytesSource(data + b"\x90" * (0x1000 - len(data)), base)
+
+
+P = 0x600200        # an absolute scratch address (observable: above the entry ESP)
+
+
+def _diamond_stub():
+    a = _Asm(STUB_BASE)
+    a.op(asm.alu("cmp", asm.reg("eax"), asm.imm(7)))
+    a.jcc("ne", "else")
+    a.op(asm.mov(asm.reg("ecx"), asm.imm(5))).jmp("end")
+    a.label("else")
+    a.op(asm.mov(asm.reg("ecx"), asm.imm(7)))
+    a.label("end")
+    a.op(_jmp("ebx"))
+    return _estub(a.build())
+
+
+def test_a_diamond_merges_its_arms():
+    src = _diamond_stub()
+    res = simplify(src, STUB_BASE, regs_in=["eax", "ebx"], regs_out=["ecx"])
+    assert res.trace.stop is None
+    assert res.outputs["ecx"].op == "ite"                 # the merge
+    assert sum(1 for s in res.kept_steps if s.kind == "jcc") == 1
+    rep = verify(src, res, runs=30)
+    assert rep.ok, str(rep)
+
+
+def _store_diamond_stub(second_store: bool = True):
+    a = _Asm(STUB_BASE)
+    a.op(asm.alu("cmp", asm.reg("eax"), asm.imm(7)))
+    a.jcc("ne", "else")
+    a.op(asm.mov(asm.mem(asm.Mem(disp=P)), asm.imm(0x11))).jmp("end")
+    a.label("else")
+    if second_store:
+        a.op(asm.mov(asm.mem(asm.Mem(disp=P)), asm.imm(0x22)))
+    a.label("end")
+    a.op(_jmp("ebx"))
+    return _estub(a.build())
+
+
+def test_stores_on_both_arms_both_survive_and_verify():
+    """A store in one arm is not "covered" by a store in the other - DSE stays per arm."""
+    src = _store_diamond_stub()
+    res = simplify(src, STUB_BASE, regs_in=["eax", "ebx"], regs_out=[])
+    stores = [s for s in res.kept_steps if s.stores]
+    assert len(stores) == 2
+    rep = verify(src, res, runs=40)
+    assert rep.ok, str(rep)
+
+
+def test_a_load_after_a_rejoin_keeps_the_store_it_may_read():
+    """The load after the rejoin can read what the taken arm stored: it has to stay."""
+    src = _store_diamond_stub(second_store=False)
+    res = simplify(src, STUB_BASE, regs_in=["eax", "ebx"], regs_out=["ecx"])
+    assert any(s.stores for s in res.kept_steps)
+    rep = verify(src, res, runs=40)
+    assert rep.ok, str(rep)
+
+
+def _nested_diamond_stub():
+    a = _Asm(STUB_BASE)
+    a.op(asm.alu("cmp", asm.reg("eax"), asm.imm(7)))
+    a.jcc("ne", "else1")
+    a.op(asm.alu("cmp", asm.reg("edx"), asm.imm(9)))
+    a.jcc("ne", "else2")
+    a.op(asm.mov(asm.reg("ecx"), asm.imm(1))).jmp("inner")
+    a.label("else2")
+    a.op(asm.mov(asm.reg("ecx"), asm.imm(2)))
+    a.label("inner")
+    a.jmp("end")
+    a.label("else1")
+    a.op(asm.mov(asm.reg("ecx"), asm.imm(3)))
+    a.label("end")
+    a.op(_jmp("ebx"))
+    return _estub(a.build())
+
+
+def test_nested_diamonds():
+    src = _nested_diamond_stub()
+    res = simplify(src, STUB_BASE, regs_in=["eax", "edx", "ebx"], regs_out=["ecx"])
+    assert res.trace.stop is None
+    assert sum(1 for s in res.kept_steps if s.kind == "jcc") == 2
+    rep = verify(src, res, runs=40)
+    assert rep.ok, str(rep)
+
+
+def _two_exit_stub():
+    a = _Asm(STUB_BASE)
+    a.op(asm.alu("test", asm.reg("eax", 8), asm.imm(1), 8))
+    a.jcc("ne", "other")
+    a.op(asm.mov(asm.reg("eax"), asm.imm(0x111)), _jmp("ebx"))
+    a.label("other")
+    a.op(asm.mov(asm.reg("eax"), asm.imm(0x222)),
+         Instruction.create(Code.RETND))
+    return _estub(a.build())
+
+
+def test_an_arm_that_exits_gives_a_second_exit():
+    for mode in ("inplace", "compact"):
+        src = _two_exit_stub()
+        res = simplify(src, STUB_BASE, regs_in=["eax", "ebx"], regs_out=["eax"], mode=mode)
+        assert len(res.exits) == 2
+        assert all(e.out_ip is not None for e in res.exits)
+        assert any("@" in k for k in res.outputs)         # per-exit values
+        rep = verify(src, res, runs=60)
+        assert rep.ok, str(rep)
+        assert all(v > 0 for v in rep.coverage.values()), str(rep)   # both exits taken
+
+
+def _mem_diamond_stub():
+    a = _Asm(STUB_BASE)
+    a.op(asm.mov(asm.reg("eax", 8), asm.mem(asm.Mem(disp=DATA), 8)))
+    a.op(asm.alu("cmp", asm.reg("eax", 8), asm.imm(7), 8))
+    a.jcc("ne", "other")
+    a.op(asm.mov(asm.reg("eax"), asm.imm(0x111)), _jmp("ebx"))
+    a.label("other")
+    a.op(asm.mov(asm.reg("eax"), asm.imm(0x222)), _jmp("ebx"))
+    return _estub(a.build())
+
+
+def test_a_constant_condition_removes_the_dead_arm():
+    src = _mem_diamond_stub()
+    taken_fall = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"], mem={DATA: 7})
+    assert taken_fall.trace.stop is None
+    assert taken_fall.outputs["eax"].op == "c" and taken_fall.outputs["eax"].args[0] == 0x111
+    assert not any(s.kind == "jcc" for s in taken_fall.kept_steps)
+    assert verify(src, taken_fall, runs=20).ok
+    taken_jump = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"], mem={DATA: 9})
+    assert taken_jump.outputs["eax"].op == "c" and taken_jump.outputs["eax"].args[0] == 0x222
+    assert verify(src, taken_jump, runs=20).ok
+
+
+def test_a_loop_with_an_exit_inside_its_span_stops():
+    """A ret between the loop head and its back edge is not a contiguous region."""
+    a = _Asm(STUB_BASE)
+    a.label("head")
+    a.op(asm.alu("cmp", asm.reg("ecx"), asm.imm(3)))
+    a.jcc("e", "tail")
+    a.op(Instruction.create(Code.RETND))
+    a.label("tail")
+    a.jmp("head")
+    src = _estub(a.build())
+    res = simplify(src, STUB_BASE, regs_in=["ecx", "ebx"], regs_out=["eax"])
+    assert res.trace.stop is not None                     # fell back to the linear walk
+
+
+# ===========================================================================================
+# the real branchy handler (0x114756A) and the spin lock (0x1141980)
+# ===========================================================================================
+BRANCHY = 0x114756A
+ARM_STORES = (0x1147653, 0x11477F6)         # [ebx+4] += edx / += 0xa
+
+
+def _arm_stores_seen(src, runs: int = 60) -> set:
+    """Which of the two arm store sites the original executes over ``runs`` seeds."""
+    from asmsim.verify import _image
+    image = _image(src, 0x1147000, 0x1149000)
+    seen: set = set()
+    for i in range(runs):
+        seed = 0x5EED + i
+        emu = Emu(seed)
+        for base, data in image.items():
+            emu.map_code(base, data)
+        emu.set_state(random_regs(random.Random(seed)))
+        ip = BRANCHY
+        for _ in range(20000):
+            if ip in ARM_STORES:
+                seen.add(ip)
+            if ip == 0x114789F:
+                break
+            emu.uc.emu_start(ip, 0, count=1)
+            ip = emu.uc.reg_read(REGS["eip"])
+        emu.close()
+    return seen
+
+
+def test_branchy_handler_inplace(src):
+    res = simplify(src, BRANCHY, regs_in=["ebx"], regs_out=["ebx"])
+    assert res.trace.stop is None
+    assert len(res.exits) == 1
+    assert sum(1 for s in res.kept_steps if s.kind == "jcc") == 1
+    assert res.stats["ins_kept"] < res.stats["ins_total"] / 2
+    assert len(res.code) == res.end - res.start
+    rep = verify(src, res, runs=40)
+    assert rep.ok, str(rep)
+
+
+def test_branchy_handler_compact_reaches_both_arms(src):
+    res = simplify(src, BRANCHY, regs_in=["ebx"], regs_out=["ebx"], mode="compact")
+    assert res.trace.stop is None
+    assert res.terminator_ip_out is not None
+    assert len(res.code) < res.end - res.start            # compact is smaller
+    rep = verify(src, res, runs=60)
+    assert rep.ok, str(rep)
+    # the branch is real: over these seeds the original walks both arms
+    assert _arm_stores_seen(src, runs=60) == set(ARM_STORES)
+
+
+def test_spin_lock_loop_is_kept_and_analysed_without_keep(src):
+    # the lock byte is only seeded so the *emulator* can get past the wait (the
+    # original deadlocks on a random byte exactly like the simplified one)
+    res = simplify(src, 0x1141980, args=["arg0", "arg1"], regs_out=["eax", "edx"],
+                   mem={0x14A0240: 0x41})
+    assert res.trace.stop is None
+    assert res.trace.regions == [(0x1141987, 0x114199D)]
+    assert any(lo == 0x1141987 and hi == 0x114199D for lo, hi, _d, _i in res.trace.keep)
+    with pytest.raises(StubError):                       # a region only fits inplace
+        simplify(src, 0x1141980, args=["arg0", "arg1"], regs_out=["eax", "edx"],
+                 mem={0x14A0240: 0x41}, mode="compact")
+    rep = verify(src, res, runs=20)
+    assert rep.ok, str(rep)
+
+
+def test_a_keep_range_cutting_into_a_loop_is_refused(src):
+    with pytest.raises(ValueError):
+        simplify(src, 0x1141980, args=["arg0", "arg1"], regs_out=["eax", "edx"],
+                 keep="0x114198a-0x114199d")      # starts inside the loop region
+
+
+def test_the_old_keep_workflow_still_verifies(src):
+    res = simplify(src, 0x1141980, args=["arg0", "arg1"], regs_out=["eax", "edx"],
+                   mem={0x14A0240: 0x41}, keep="0x1141987-0x114199d")
+    assert res.trace.stop is None
+    rep = verify(src, res, runs=20)
+    assert rep.ok, str(rep)
+
+
+# ===========================================================================================
+# the slice invariant over the control-flow graph
+# ===========================================================================================
+def _reaching_defs_are_kept(res):
+    """No kept instruction may read a register whose reaching writer (on any path)
+    was dropped - the CFG form of the old linear invariant."""
+    trace = res.trace
+    out: dict = {}
+    by_id = {id(s): s for s in trace.steps}
+    allnames = list(REG32) + FLAGS
+    for s in trace.order:
+        if not s.preds:
+            cur = {n: frozenset([None]) for n in allnames}
+        else:
+            cur = {}
+            for p in s.preds:
+                for n, v in out[id(p)].items():
+                    cur[n] = cur.get(n, frozenset()) | v
+        if s.kept:
+            for n in sorted(set(s.reads) | set(s.flag_reads)):
+                if n in ("esp", "df"):
+                    continue
+                for w in cur.get(n, frozenset()):
+                    assert w is None or by_id[w].kept, \
+                        f"{s.ip:#x} reads {n} whose writer was dropped"
+        after = dict(cur)
+        for n in set(s.writes) | set(s.flag_writes):
+            after[n] = frozenset([id(s)])
+        out[id(s)] = after
+
+
+def test_reaching_defs_survive_the_slice(src):
+    for res in (
+        simplify(src, BRANCHY, regs_in=["ebx"], regs_out=["ebx"]),
+        simplify(src, BRANCHY, regs_in=["ebx"], regs_out=["ebx"], mode="compact"),
+        simplify(src, 0x1141980, args=["arg0", "arg1"], regs_out=["eax", "edx"],
+                 mem={0x14A0240: 0x41}),
+        simplify(_diamond_stub(), STUB_BASE, regs_in=["eax", "ebx"], regs_out=["ecx"]),
+        simplify(_nested_diamond_stub(), STUB_BASE, regs_in=["eax", "edx", "ebx"],
+                 regs_out=["ecx"]),
+        simplify(_store_diamond_stub(), STUB_BASE, regs_in=["eax", "ebx"], regs_out=[]),
+        simplify(_two_exit_stub(), STUB_BASE, regs_in=["eax", "ebx"], regs_out=["eax"]),
+    ):
+        _reaching_defs_are_kept(res)

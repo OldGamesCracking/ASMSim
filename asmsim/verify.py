@@ -14,6 +14,12 @@ What is compared:
   the entry ESP is the stub's private frame; that is the one assumption the
   simplifier's dead-store analysis makes).
 
+A stub with several exits is verified per exit: each run stops at whichever exit
+it reaches and the two programs must agree on *which* exit that was, on the
+registers that exit's terminator reads, and on the memory.  The report says how
+many runs took each exit, so a branch that one side never walks cannot look like a
+clean pass.
+
 Registers that are neither outputs nor exits are reported separately when they
 differ: dropping them is the point of the simplification, not a failure.
 """
@@ -37,6 +43,7 @@ class Report:
     mismatches: list[str]
     discarded: list[str]
     compare_memory: bool = True
+    coverage: dict = dataclasses.field(default_factory=dict)   # exit index -> runs that took it
 
     def __str__(self) -> str:
         lines = [f"verify: {self.runs} randomised runs, {self.skipped} skipped"]
@@ -48,6 +55,13 @@ class Report:
         else:
             lines.append("  outputs" + (" and observable memory" if self.compare_memory else "")
                          + " match the original")
+        if len(self.coverage) > 1:
+            lines.append("  exits taken: "
+                         + ", ".join(f"#{k}: {v}" for k, v in sorted(self.coverage.items())))
+            never = [k for k, v in sorted(self.coverage.items()) if v == 0]
+            if never:
+                lines.append(f"  !! exit(s) {', '.join('#' + str(k) for k in never)} were never "
+                             f"taken - the simplified code may hide a difference there")
         if self.discarded:
             lines.append(f"  discarded registers (by design, not outputs): {', '.join(self.discarded)}")
         return "\n".join(lines)
@@ -64,15 +78,16 @@ def _image(src, lo: int, hi: int) -> dict[int, bytes]:
     return out
 
 
-def _prepare(image: dict[int, bytes], stop_at: int, seed: int, max_insns: int = 200000,
-             args: Sequence[tuple[int, int]] = (),
+def _prepare(image: dict[int, bytes], stops: dict[int, int], seed: int,
+             max_insns: int = 200000, args: Sequence[tuple[int, int]] = (),
              mem: Sequence[tuple[int, int]] = ()) -> Emu:
-    """An emulator with the code image mapped that stops right *before* ``stop_at``.
+    """An emulator with the code image mapped that stops right *before* any exit.
 
-    The stop is done by stepping one instruction at a time - unicorn's
-    ``emu_stop()`` from a code hook only takes effect at a translation block
-    boundary, which would execute the terminator (and everything after it in the
-    same block) in one program but not the other.
+    ``stops`` maps an exit's address to its key; ``execute`` runs until one of them
+    is reached and returns that key.  The stop is done by stepping one instruction
+    at a time - unicorn's ``emu_stop()`` from a code hook only takes effect at a
+    translation block boundary, which would execute the terminator (and everything
+    after it in the same block) in one program but not the other.
 
     ``args`` are the concrete stack arguments as ``(offset from entry ESP, value)``
     and ``mem`` the known memory contents as ``(absolute address, value)``: both are
@@ -83,7 +98,7 @@ def _prepare(image: dict[int, bytes], stop_at: int, seed: int, max_insns: int = 
         emu.map_code(base, data)
     eip = REGS["eip"]
 
-    def run(regs: dict, start: int, code: bytes | None = None, run_seed: int = seed) -> None:
+    def run(regs: dict, start: int, code: bytes | None = None, run_seed: int = seed) -> int:
         emu.reset(run_seed)
         if code is not None:
             emu.write_image(start, code)
@@ -98,11 +113,12 @@ def _prepare(image: dict[int, bytes], stop_at: int, seed: int, max_insns: int = 
         emu.write_log.clear()
         ip = start
         for _ in range(max_insns):
-            if ip == stop_at:
-                return
+            key = stops.get(ip)
+            if key is not None:
+                return key
             emu.uc.emu_start(ip, 0, count=1)
             ip = emu.uc.reg_read(eip)
-        raise RuntimeError(f"never reached {stop_at:#x}")
+        raise RuntimeError(f"never reached any of {[hex(x) for x in stops]}")
 
     emu.execute = run                                   # type: ignore[attr-defined]
     return emu
@@ -110,41 +126,51 @@ def _prepare(image: dict[int, bytes], stop_at: int, seed: int, max_insns: int = 
 
 def verify(src, res: Result, runs: int = 100, seed0: int = 0x5EED,
            max_insns: int = 200000, compare_memory: bool = True) -> Report:
-    term = res.trace.terminator
-    if term is None:
+    if not res.exits:
         return Report(False, 0, 0, ["analysis stopped early - nothing to verify"], [])
-    stop_out = res.terminator_ip_out
-    if stop_out is None:                                   # pragma: no cover - defensive
-        return Report(False, 0, 0, ["cannot locate the terminator in the output"], [])
-    image = _image(src, min(res.start, term.ip) - 0x2000, max(res.end, term.end) + 0x2000)
+    stop_orig = {e.step.ip: i for i, e in enumerate(res.exits)}
+    stop_simp = {e.out_ip: i for i, e in enumerate(res.exits)}
+    if (None in stop_simp or len(stop_orig) != len(res.exits)
+            or len(stop_simp) != len(res.exits)):
+        return Report(False, 0, 0, ["cannot locate the exits in the output"], [])
+    lo = min(min(e.step.ip for e in res.exits), res.start)
+    hi = max(max(e.step.end for e in res.exits), res.end)
+    image = _image(src, lo - 0x2000, hi + 0x2000)
 
-    compare = list(res.compare_regs)
-    other = [n for n in ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp") if n not in compare]
+    others = ("eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp")
     mismatches: list[str] = []
     discarded: set[str] = set()
+    coverage: dict = {i: 0 for i in range(len(res.exits))}
     skipped = 0
 
     concrete_args = sorted(res.concrete_args.items())
     concrete_mem = sorted(res.concrete_mem.items())
-    a = _prepare(image, term.ip, seed0, max_insns, args=concrete_args, mem=concrete_mem)
-    b = _prepare(image, stop_out, seed0, max_insns, args=concrete_args, mem=concrete_mem)
+    a = _prepare(image, stop_orig, seed0, max_insns, args=concrete_args, mem=concrete_mem)
+    b = _prepare(image, stop_simp, seed0, max_insns, args=concrete_args, mem=concrete_mem)
     try:
         for i in range(runs):
             seed = seed0 + i
             regs = random_regs(random.Random(seed))
             regs.update(res.concrete)          # the run assumes these entry values
             try:
-                a.execute(regs, res.start)
-                b.execute(regs, res.start, code=res.code)
+                which_a = a.execute(regs, res.start)
+                which_b = b.execute(regs, res.start, code=res.code)
             except Exception:
                 skipped += 1
                 continue
             sa, sb = a.get_state(), b.get_state()
             where = f"seed={seed:#x} regs0={{{', '.join(f'{k}={v:#x}' for k, v in sorted(regs.items()))}}}"
-            for name in compare:
-                if sa[name] != sb[name]:
-                    mismatches.append(f"{name}: original {sa[name]:#x} != simplified {sb[name]:#x} ({where})")
-            for name in other:
+            if which_a != which_b:
+                mismatches.append(f"exit taken: original #{which_a} != simplified "
+                                  f"#{which_b} ({where})")
+            else:
+                coverage[which_a] += 1
+                compare = res.exits[which_a].compare
+                for name in compare:
+                    if sa[name] != sb[name]:
+                        mismatches.append(f"{name}: original {sa[name]:#x} != "
+                                          f"simplified {sb[name]:#x} ({where})")
+            for name in others:
                 if sa[name] != sb[name]:
                     discarded.add(name)
             if sa["eflags"] != sb["eflags"]:
@@ -165,4 +191,5 @@ def verify(src, res: Result, runs: int = 100, seed0: int = 0x5EED,
         # every execution failed before the comparison - that is not a pass
         mismatches.append(f"all {runs} runs were skipped (nothing to compare)")
     return Report(ok=not mismatches, runs=runs - skipped, skipped=skipped,
-                  mismatches=mismatches, discarded=sorted(discarded), compare_memory=compare_memory)
+                  mismatches=mismatches, discarded=sorted(discarded),
+                  compare_memory=compare_memory, coverage=coverage)

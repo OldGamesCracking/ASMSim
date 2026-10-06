@@ -12,6 +12,18 @@ the ``is_end`` callback returns True (by default: an indirect ``jmp`` or a
 ``ret``); bytes that a ``jmp +1`` skips over therefore never become instructions,
 which is exactly how the classic "jump over junk" obfuscation is removed.
 
+Conditional branches no longer end the analysis: both arms are followed, and where
+they meet again the two symbolic states merge - registers and flags through ``ite``
+terms, memory through the agree-or-opaque rule of :mod:`asmsim.memory`.  A branch
+whose condition folds to a constant keeps only the reachable arm (the dead one is
+NOPed away and its flag producers die with it).  A loop - a cycle in the decoded
+graph - is emitted verbatim as a region and the analysis continues behind it with
+every register/flag the loop touches unknown and its memory behind a barrier, so a
+stub with a spin lock no longer needs ``--mem``/``--keep`` to be simplified.  Every
+``jcc`` that stays in the output is emitted as it was, so the branch (and whatever
+computed its flags) survives.  Whenever a shape cannot be handled soundly the
+analysis falls back to the plain linear walk and reports ``stop``.
+
 Every instruction of that trace is then lifted with :mod:`asmsim.lift` and its
 effect (registers, flags, memory) is derived from the resulting term DAG.  A
 backward liveness pass keeps an instruction only if it
@@ -42,13 +54,14 @@ from __future__ import annotations
 import dataclasses
 from typing import Callable, Iterable, Mapping, Sequence
 
-from iced_x86 import Decoder, FlowControl as FC, Instruction, InstructionInfoFactory
+from iced_x86 import (Code, Decoder, Encoder, FlowControl as FC, Instruction,
+                      InstructionInfoFactory)
 from iced_x86 import Mnemonic as MN
 from iced_x86 import OpAccess, OpKind as OK, RflagsBits as RB
 
 from . import terms as T
 from .lift import FLAGS, REG32, REGINFO, Lifter, State, Unsupported
-from .memory import DECL_SIZE, Store, stack_offset
+from .memory import DECL_SIZE, Memory, Store, stack_offset
 from .x86asm import fmt as _fmt_ins
 
 MAX_INSN = 15
@@ -218,6 +231,12 @@ class Step:
     esp_off_before: int | None = 0    # ... and before it
     live_regs_after: frozenset = frozenset()
     live_flags_after: frozenset = frozenset()
+    # --- control flow graph (only filled in by the branch-aware analysis) ---
+    edges: tuple = ()                 # ((succ_ip, guard term), ...) feasible edges only
+    succs: tuple = ()                 # the Step objects of those edges
+    preds: tuple = ()                 # the Step objects that can flow into this one
+    force_keep: bool = False          # kept so a dropped jump stays transparent
+    mem: object = None                # the Memory node this step's stores went into
 
     @property
     def end(self) -> int:
@@ -239,10 +258,14 @@ class Step:
         return self.ins.op_count
 
     def encoded(self) -> bytes:
-        """The bytes this step will emit (NOP padded up to its region)."""
+        """The bytes this step will emit (NOP padded up to its region).
+
+        A re-encoded branch may come out *shorter* than the original (iced releases
+        a near branch whose target is close): the padding NOPs are unreachable
+        (either the branch jumps away, or they are simply fallen through)."""
         data = _encode_instrs(self.instrs(), self.ip)
         want = self.region_end - self.ip
-        if len(data) < want and (self.rewritten or self.repl is not None):
+        if len(data) < want:
             data += b"\x90" * (want - len(data))
         return data
 
@@ -259,10 +282,23 @@ class Trace:
     # instructions).  Their instructions are still lifted and stepped - the trace
     # follows them normally - but nothing inside is rewritten or dropped.
     keep: list[tuple[int, int, bytes, list]] = dataclasses.field(default_factory=list)
+    # ── branch-aware analysis ──────────────────────────────────────────────
+    terminators: list[Step] = dataclasses.field(default_factory=list)
+    exit_states: dict = dataclasses.field(default_factory=dict)   # exit ip -> State
+    order: list[Step] = dataclasses.field(default_factory=list)   # topological order
+    # every decoded instruction, including ones no path reaches any more (their
+    # bytes are NOPs / dropped); used for the end of the stub and the byte stats
+    all_steps: list[Step] = dataclasses.field(default_factory=list)
+    memories: list = dataclasses.field(default_factory=list)      # every Memory node
+    regions: list[tuple[int, int]] = dataclasses.field(default_factory=list)
+    _end: int | None = None                                       # furthest decoded byte
 
     @property
     def end(self) -> int:
-        return self.steps[-1].end if self.steps else self.start
+        ends = [s.region_end for s in self.steps]
+        if self._end is not None:
+            ends.append(self._end)
+        return max(ends + [self.start])
 
     def in_keep(self, ip: int) -> bool:
         return any(lo <= ip < hi for lo, hi, _, _ in self.keep)
@@ -349,13 +385,327 @@ def term_deps(terms: Iterable[T.Term], memo: dict | None = None) -> tuple[frozen
 
 
 # ===========================================================================================
-# discovery + symbolic lifting (one pass - the flow decides where the next instruction is)
+# discovery: decode the reachable control-flow graph (no states yet) and decide which engine
+# can handle it - the linear walk of old for branch-free stubs, the branch-aware state pass
+# for anything that forks or loops.
+# ===========================================================================================
+class _Fallback(Exception):
+    """The branch-aware analysis cannot handle this stub; use the linear walk."""
+
+
+@dataclasses.dataclass
+class _Cfg:
+    start: int
+    specs: dict          # ip -> (ins, raw, kind, successor addresses; may hold undecodable)
+    bad: frozenset       # addresses that did not decode
+
+
+_LIFTABLE_JCC = frozenset(
+    [getattr(MN, "J" + n) for n in ("O", "NO", "B", "AE", "E", "NE", "BE", "A", "S", "NS",
+                                    "P", "NP", "L", "GE", "LE", "G")] + [MN.JECXZ])
+_HALTING = frozenset({MN.HLT, MN.INT3, MN.UD2, MN.INT, MN.INTO, MN.INT1, MN.SYSENTER,
+                      MN.SYSCALL})
+
+
+def _classify(ins, is_end):
+    """(kind, successor addresses) of one instruction - syntactic only."""
+    if is_end(ins):
+        return "term", ()
+    fc = ins.flow_control
+    if fc == FC.CONDITIONAL_BRANCH:
+        if ins.mnemonic in _LIFTABLE_JCC:
+            return "jcc", (ins.near_branch_target, ins.next_ip)
+        return "term", ()                  # a branch the lifter does not model
+    if ins.mnemonic in _HALTING or fc == FC.INTERRUPT:
+        return "term", ()
+    if fc in (FC.UNCONDITIONAL_BRANCH, FC.CALL):
+        if ins.op_kind(0) == OK.NEAR_BRANCH32:
+            return "jump", (ins.near_branch_target,)
+        return "term", ()                  # indirect jmp / call: the flow leaves the stub
+    if fc in (FC.RETURN, FC.INDIRECT_BRANCH):
+        return "term", ()
+    return "", (ins.next_ip,)
+
+
+def _discover(src, start, is_end, max_instructions):
+    specs: dict[int, tuple] = {}
+    bad: set[int] = set()
+    work = [start]
+    while work:
+        ip = work.pop()
+        if ip in specs or ip in bad:
+            continue
+        if len(specs) >= max_instructions:
+            return None
+        try:
+            window = src.read(ip, _DECODE_WINDOW)
+        except StubError:
+            bad.add(ip)
+            continue
+        ins = Decoder(32, window, ip=ip).decode()
+        if ins.len <= 0 or ins.is_invalid:
+            bad.add(ip)
+            continue
+        kind, succs = _classify(ins, is_end)
+        specs[ip] = (ins, window[:ins.len], kind, succs)
+        work.extend(succs)
+    if not specs:
+        return None
+    prev_end = None
+    for ip in sorted(specs):
+        if prev_end is not None and ip < prev_end:
+            return None                    # a branch into an instruction: the linear walk decides
+        prev_end = ip + len(specs[ip][1])
+    for _ins, _raw, kind, succs in specs.values():
+        if kind != "jcc" and any(s in bad for s in succs):
+            return None                    # runs into undecodable bytes: the linear walk decides
+    return _Cfg(start, specs, frozenset(bad))
+
+
+def _has_junction(cfg) -> bool:
+    """True when the graph forks or loops - then the linear walk cannot do the job."""
+    preds = {ip: 0 for ip in cfg.specs}
+    for _ins, _raw, _kind, succs in cfg.specs.values():
+        if len(succs) > 1:
+            return True
+        for s in succs:
+            if s in preds:
+                preds[s] += 1
+    for ip, n in preds.items():
+        if ip == cfg.start:
+            if n:
+                return True                # something jumps back to the entry
+        elif n != 1:
+            return True
+    return False
+
+
+def _sccs(nodes, succ):
+    """Tarjan's strongly connected components, iterative (stubs can be deep)."""
+    index: dict = {}
+    low: dict = {}
+    on: set = set()
+    stack: list = []
+    comps: list = []
+    counter = 0
+    for root in nodes:
+        if root in index:
+            continue
+        index[root] = low[root] = counter
+        counter += 1
+        stack.append(root)
+        on.add(root)
+        work = [(root, iter(succ.get(root, ())))]
+        while work:
+            v, it = work[-1]
+            advanced = False
+            for w in it:
+                if w not in index:
+                    index[w] = low[w] = counter
+                    counter += 1
+                    stack.append(w)
+                    on.add(w)
+                    work.append((w, iter(succ.get(w, ()))))
+                    advanced = True
+                    break
+                if w in on:
+                    low[v] = min(low[v], index[w])
+            if advanced:
+                continue
+            work.pop()
+            if low[v] == index[v]:
+                comp = []
+                while True:
+                    w = stack.pop()
+                    on.discard(w)
+                    comp.append(w)
+                    if w == v:
+                        break
+                comps.append(comp)
+            if work:
+                low[work[-1][0]] = min(low[work[-1][0]], low[v])
+    return comps
+
+
+# ---- merging symbolic states at a rejoin ---------------------------------------------------
+_UNDEF_MEMO: dict[int, bool] = {}
+
+
+def _has_undef(t: T.Term) -> bool:
+    """Does the term contain an ``undef`` leaf?  Such a value must never select a path."""
+    memo = _UNDEF_MEMO
+    stack = [t]
+    while stack:
+        n = stack[-1]
+        if n.uid in memo:
+            stack.pop()
+            continue
+        pending = [a for a in n.operands() if a.uid not in memo]
+        if pending:
+            stack.extend(pending)
+            continue
+        memo[n.uid] = n.op == "undef" or any(memo[a.uid] for a in n.operands())
+        stack.pop()
+    return memo[t.uid]
+
+
+def _guards_complement(g1: T.Term, g2: T.Term):
+    """``(cond, first_is_true)`` when the two guards are the sides of one condition."""
+    if g1.op == "not" and g1.args[0] is g2:
+        return g2, False
+    if g2.op == "not" and g2.args[0] is g1:
+        return g1, True
+    if g1.op == "and" and g2.op == "and" and g1.args[0] is g2.args[0]:
+        a, b = g1.args[1], g2.args[1]
+        if b.op == "not" and b.args[0] is a:
+            return a, True
+        if a.op == "not" and a.args[0] is b:
+            return b, False
+    return None
+
+
+def _merge_vals(vals, guards):
+    """One value for a location written on several paths.
+
+    All values identical (hash-consing makes that the common case) -> that value.
+    Two complementary guards -> one ``ite``; otherwise a guard chain.  A guard that
+    is not exact (contains ``undef``, e.g. after a loop region) may not select: a
+    fresh ``undef`` selector keeps the result an over-approximation, which is what
+    every downstream rule (folding, pruning, liveness) is sound against.
+    """
+    if all(v is vals[0] for v in vals):
+        return vals[0]
+    if len(vals) == 2 and not _has_undef(guards[0]) and not _has_undef(guards[1]):
+        c = _guards_complement(guards[0], guards[1])
+        if c is not None and not _has_undef(c[0]):
+            return T.ite(c[0], vals[0] if c[1] else vals[1], vals[1] if c[1] else vals[0])
+    out = vals[-1]
+    for i in range(len(vals) - 2, -1, -1):
+        sel = guards[i] if not _has_undef(guards[i]) else T.undef(1)
+        out = T.ite(sel, vals[i], out)
+    return out
+
+
+def _merge_state(states, guards, memories, isolate):
+    """A fresh merged State whose memory joins the arms' chains."""
+    mems = [s.mem for s in states]
+    node = Memory(isolate, join=(None, mems[-2], mems[-1]))
+    for m in reversed(mems[:-2]):
+        node = Memory(isolate, join=(None, m, node))
+    node.arg_slots = mems[0].arg_slots
+    node.mem_slots = mems[0].mem_slots
+    memories.append(node)
+    st = State(isolate)
+    st.mem = node
+    for n in REG32:
+        st.regs[n] = _merge_vals([p.regs[n] for p in states], guards)
+    for f in FLAGS:
+        vals = [p.flags[f] for p in states]
+        merged = _merge_vals(vals, guards)
+        st.flags[f] = merged
+        orgs = [p.forigin[f] for p in states]
+        # a stale origin would let lift.cond synthesize a condition that no longer
+        # describes this flag term - the one way a merge could go unsound
+        st.forigin[f] = (orgs[0] if merged is vals[0] and all(o == orgs[0] for o in orgs)
+                         else None)
+    return st
+
+
+def _make_jmp(ip: int, target: int) -> Instruction | None:
+    """A jump to ``target`` (short when it fits), or None when it cannot be built."""
+    try:
+        if -128 <= target - (ip + 2) <= 127:
+            return Instruction.create_branch(Code.JMP_REL8_32, target)
+        return Instruction.create_branch(Code.JMP_REL32_32, target)
+    except Exception:                              # pragma: no cover - defensive
+        return None
+
+
+def _region_touched(members, specs):
+    """Every register/flag any instruction of a loop region reads *or writes*."""
+    regs: set = set()
+    flags: set = set()
+    for m in members:
+        ins = specs[m][0]
+        r, f = arch_reads(ins)
+        regs |= r
+        flags |= f
+        info = _INFO.info(ins)
+        used = info.used_registers() if callable(info.used_registers) else info.used_registers
+        for u in used:
+            entry = REGINFO.get(u.register)
+            if entry is not None:
+                regs.add(entry[0])
+        for n, bit in _FLAG_BITS.items():
+            if ins.rflags_written & bit:
+                flags.add(n)
+    return regs, flags
+
+
+def _lift_one(st, lifter, ins, ip, raw, memo):
+    """Apply one instruction to ``st``; return the pieces a Step is built from."""
+    pre_regs, pre_flags = dict(st.regs), dict(st.flags)
+    loads: list[Load] = []
+    orig_load = st.mem.load
+
+    def recording_load(seg, addr, nbytes, _orig=orig_load, _loads=loads, _st=st):
+        may = _st.mem.may_read(seg, addr, nbytes)
+        t = _orig(seg, addr, nbytes)
+        _loads.append(Load(seg, addr, nbytes, t, may))
+        return t
+
+    n_stores = len(st.mem.stores)
+    st.mem.load = recording_load
+    try:
+        flow = lifter.step(ins)
+    finally:
+        del st.mem.load
+
+    writes = frozenset(n for n in REG32 if st.regs[n] is not pre_regs[n])
+    fwrites = frozenset(n for n in FLAGS if st.flags[n] is not pre_flags[n])
+    new_stores = tuple(st.mem.stores[n_stores:])
+
+    roots = [st.regs[n] for n in writes] + [st.flags[n] for n in fwrites]
+    for s in new_stores:
+        roots += [s.addr, s.val]
+    roots += [l.addr for l in loads]
+    reads, flag_reads = term_deps(roots, memo)
+    areads, aflags = arch_reads(ins)
+    reads |= areads
+    flag_reads |= aflags
+    return (flow, pre_regs, pre_flags, writes, fwrites, tuple(loads), new_stores,
+            reads, flag_reads)
+
+
+# ===========================================================================================
+# analysis entry point: branch-free stubs keep the linear walk; anything else gets the
+# branch-aware pass, which falls back to the linear walk when it cannot be sound
 # ===========================================================================================
 def analyse(src, start: int, is_end: Callable[[Instruction], bool] = is_terminator, *,
             concrete: Mapping[str, int] | None = None, args: Mapping[int, T.Term] | None = None,
-            mem: Mapping[int, T.Term] | None = None,
-            max_instructions: int = 20000) -> Trace:
+            mem: Mapping[int, T.Term] | None = None, max_instructions: int = 20000,
+            keep_ranges: Sequence[tuple[int, int]] = ()) -> Trace:
     """Decode and lift the stub from ``start`` until ``is_end`` says stop."""
+    def linear():
+        return _analyse_linear(src, start, is_end, concrete=concrete, args=args, mem=mem,
+                               max_instructions=max_instructions)
+
+    cfg = _discover(src, start, is_end, max_instructions)
+    if cfg is None or not _has_junction(cfg):
+        return linear()
+    try:
+        return _analyse_cfg(src, cfg, is_end, concrete=concrete, args=args, mem=mem,
+                            max_instructions=max_instructions, keep_ranges=keep_ranges)
+    except _Fallback:
+        return linear()
+
+
+def _analyse_linear(src, start: int, is_end: Callable[[Instruction], bool] = is_terminator, *,
+                    concrete: Mapping[str, int] | None = None,
+                    args: Mapping[int, T.Term] | None = None,
+                    mem: Mapping[int, T.Term] | None = None,
+                    max_instructions: int = 20000) -> Trace:
+    """One straight-line path - the walk of old, also the fallback for anything else."""
     st = State.initial(concrete=dict(concrete or {}), args=dict(args or {}),
                        mem=dict(mem or {}))
     lifter = Lifter(st)
@@ -383,41 +733,15 @@ def analyse(src, start: int, is_end: Callable[[Instruction], bool] = is_terminat
         if steps and steps[-1].end < ip:
             dead.append((steps[-1].end, ip))
 
-        pre_regs, pre_flags = dict(st.regs), dict(st.flags)
-        loads: list[Load] = []
-        orig_load = st.mem.load
-
-        def recording_load(seg, addr, nbytes, _orig=orig_load, _loads=loads, _st=st):
-            may = _st.mem.may_read(seg, addr, nbytes)
-            t = _orig(seg, addr, nbytes)
-            _loads.append(Load(seg, addr, nbytes, t, may))
-            return t
-
-        n_stores = len(st.mem.stores)
-        st.mem.load = recording_load
         try:
-            flow = lifter.step(ins)
+            (flow, pre_regs, pre_flags, writes, fwrites, loads, new_stores, reads,
+             flag_reads) = _lift_one(st, lifter, ins, ip, raw, memo)
         except Unsupported as e:
             stop = AnalysisStop(ip, f"unsupported instruction: {e.ins} ({e.why or 'no semantics'})")
             break
-        finally:
-            del st.mem.load
-
-        writes = frozenset(n for n in REG32 if st.regs[n] is not pre_regs[n])
-        fwrites = frozenset(n for n in FLAGS if st.flags[n] is not pre_flags[n])
-        new_stores = tuple(st.mem.stores[n_stores:])
-
-        roots = [st.regs[n] for n in writes] + [st.flags[n] for n in fwrites]
-        for s in new_stores:
-            roots += [s.addr, s.val]
-        roots += [l.addr for l in loads]
-        reads, flag_reads = term_deps(roots, memo)
-        areads, aflags = arch_reads(ins)
-        reads |= areads
-        flag_reads |= aflags
 
         step = Step(ins=ins, ip=ip, raw=raw, flow=flow, writes=writes, flag_writes=fwrites,
-                    reads=reads, flag_reads=flag_reads, loads=tuple(loads), stores=new_stores,
+                    reads=reads, flag_reads=flag_reads, loads=loads, stores=new_stores,
                     values={n: st.regs[n] for n in writes} | {f: st.flags[f] for f in fwrites},
                     pre={n: pre_regs[n] for n in writes},
                     esp_off=stack_offset(st.regs["esp"]),
@@ -446,18 +770,28 @@ def analyse(src, start: int, is_end: Callable[[Instruction], bool] = is_terminat
             break
 
     trace = Trace(start=start, steps=steps, state=st, stop=stop, terminator=term, dead_bytes=dead)
-    _terminator_reads(trace, memo)
+    trace.terminators = [term] if term is not None else []
+    trace.order = list(steps)
+    trace.memories = [st.mem]
+    if term is not None:
+        trace.exit_states[term.ip] = st
+    for prev, nxt in zip(steps, steps[1:]):
+        prev.succs = (nxt,)
+        nxt.preds = (prev,)
+    for s in steps:
+        s.mem = st.mem
+    _terminator_reads(term, memo)
+    _set_dead_below(trace)
     return trace
 
 
-def _terminator_reads(trace: Trace, memo: dict) -> None:
-    """Registers/flags the final instruction reads.
+def _terminator_reads(term: Step | None, memo: dict) -> None:
+    """Registers/flags the terminating instruction reads.
 
     Memory operands (``ret`` pops, ``jmp [mem]``) were already recorded by the
     load hook while the instruction was lifted, so only register operands and the
     indirect flow's term are left.
     """
-    term = trace.terminator
     if term is None:
         return
     regs: set[str] = set()
@@ -482,6 +816,251 @@ def _terminator_reads(trace: Trace, memo: dict) -> None:
     areads, aflags = arch_reads(ins)
     term.reads = frozenset(term.reads | regs | areads)
     term.flag_reads = frozenset(term.flag_reads | flags | aflags)
+
+
+def _or_all(gs):
+    out = gs[-1]
+    for g in reversed(gs[:-1]):
+        out = T.or_(g, out)
+    return out
+
+
+def _set_dead_below(trace: Trace) -> None:
+    """Give every memory node the lowest byte offset (from the entry ESP) that any exit
+    reachable from its last step can still observe; ``None`` means "eliminate nothing"."""
+    reach: dict[int, set] = {}
+    for s in reversed(trace.order):
+        mem = getattr(s, "mem", None)
+        if mem is not None:
+            mem.last_step = s                     # the chain end that used this node
+        if not s.succs:
+            reach[id(s)] = {s.ip} if s.kind == "term" else set()
+        else:
+            acc: set = set()
+            for t in s.succs:
+                acc |= reach.get(id(t), set())
+            reach[id(s)] = acc
+    for mem in trace.memories:
+        last = getattr(mem, "last_step", None)
+        if last is None or id(last) not in reach:
+            mem.dead_below = None
+            continue
+        offs: list[int] | None = []
+        for ip in reach[id(last)]:
+            est = trace.exit_states.get(ip)
+            off = stack_offset(est.regs["esp"]) if est is not None else None
+            if off is None:
+                offs = None
+                break
+            offs.append(off)
+        mem.dead_below = min(offs) if offs else None
+
+
+# ===========================================================================================
+# branch-aware analysis: one state pass in topological order over the discovered graph.
+# Every instruction is lifted exactly once (Store identity is load bearing), each loop SCC
+# is kept verbatim and continued past with unknown results, and where paths meet the states
+# merge - registers/flags through ite terms, memory through agree-or-opaque (memory.py).
+# ===========================================================================================
+def _analyse_cfg(src, cfg: _Cfg, is_end, *, concrete, args, mem, max_instructions,
+                 keep_ranges) -> Trace:
+    specs = cfg.specs
+    succ = {ip: tuple(x for x in sp[3] if x not in cfg.bad) for ip, sp in specs.items()}
+
+    # ---- loops: every cyclic SCC becomes one verbatim region ------------------------------
+    region_of: dict[int, int] = {}
+    regions: dict[int, list[int]] = {}
+    for comp in _sccs(list(specs), succ):
+        if len(comp) == 1 and comp[0] not in succ.get(comp[0], ()):
+            continue                                        # not a loop
+        members = sorted(comp)
+        lo = members[0]
+        end = {m: m + len(specs[m][1]) for m in members}
+        cur = lo
+        for m in members:
+            if m != cur:
+                raise _Fallback("loop body is not contiguous")
+            cur = end[m]
+        hi = cur
+        member_set = set(members)
+        if any(lo <= ip < hi and ip not in member_set for ip in specs):
+            raise _Fallback("loop span contains code that is not part of the loop")
+        for m in members:
+            if any(x in cfg.bad for x in specs[m][3]):
+                raise _Fallback("loop body runs into undecodable bytes")
+        for klo, khi in keep_ranges:
+            if klo < hi and lo < khi and not (klo <= lo and hi <= khi):
+                raise ValueError(f"the kept range {klo:#x}-{khi:#x} cuts into the loop at "
+                                 f"{lo:#x}-{hi:#x} (keep the whole loop, or none of it)")
+        for m in members:
+            region_of[m] = lo
+        regions[lo] = members
+
+    def node_of(ip):
+        return region_of.get(ip, ip)
+
+    # ---- contracted graph and its topological order ---------------------------------------
+    csucc: dict[int, list[int]] = {}
+    for ip in specs:
+        if region_of.get(ip, ip) != ip:
+            continue                                        # non-head region member
+        out: list[int] = []
+        for m in ([ip] if ip not in regions else regions[ip]):
+            for s in succ[m]:
+                n = node_of(s)
+                if n == ip:                                 # an edge inside this region
+                    continue
+                if n not in out:
+                    out.append(n)
+        csucc[ip] = out
+    cpreds: dict[int, list[int]] = {n: [] for n in csucc}
+    indeg = {n: 0 for n in csucc}
+    for n, ss in csucc.items():
+        for s in ss:
+            cpreds[s].append(n)
+            indeg[s] += 1
+    queue = [n for n, d in indeg.items() if d == 0]
+    topo: list[int] = []
+    while queue:
+        n = queue.pop()
+        topo.append(n)
+        for s in csucc[n]:
+            indeg[s] -= 1
+            if indeg[s] == 0:
+                queue.append(s)
+    if len(topo) != len(csucc):
+        raise _Fallback("control flow is irreducible")
+
+    # ---- the state pass --------------------------------------------------------------------
+    st0 = State.initial(concrete=dict(concrete or {}), args=dict(args or {}),
+                        mem=dict(mem or {}))
+    iso = st0.mem.isolate_new_stack
+    memo: dict = {}
+    steps: dict[int, Step] = {}
+    entry: dict[int, list] = {node_of(cfg.start): [(st0, T.TRUE)]}
+    exit_states: dict[int, State] = {}
+    terminators: list[Step] = []
+    memories: list[Memory] = [st0.mem]
+
+    for node in topo:
+        inc = entry.get(node, ())
+        if not inc:
+            continue                                        # pruned: nothing can reach it
+        guards = [g for _st, g in inc]
+
+        if node in regions:
+            members = regions[node]
+            st = inc[0][0] if len(inc) == 1 else _merge_state([x for x, _g in inc], guards,
+                                                              memories, iso)
+            regs, flags = _region_touched(members, specs)
+            est = st.copy()
+            for r in regs:
+                est.regs[r] = T.undef(32)
+            for f in flags:
+                est.flags[f] = T.undef(1)
+                est.forigin[f] = None
+            bare = Memory(iso, barrier=st.mem)
+            bare.arg_slots = st.mem.arg_slots
+            bare.mem_slots = st.mem.mem_slots
+            memories.append(bare)
+            est.mem = bare
+            step = Step(ins=specs[members[0]][0], ip=node,
+                        raw=b"".join(specs[m][1] for m in members), flow=None,
+                        writes=frozenset(), flag_writes=frozenset(),
+                        reads=frozenset(regs), flag_reads=frozenset(flags))
+            step.kind = "loop"
+            step.kept = True
+            step.esp_off = None
+            step.esp_off_before = None
+            step.mem = bare
+            steps[node] = step
+            for s in csucc[node]:
+                entry.setdefault(s, []).append((est, T.undef(1)))   # exits are not exact
+            continue
+
+        ins, raw, kind, raw_succs = specs[node]
+        if len(inc) == 1 and cpreds[node] and len(csucc[cpreds[node][0]]) == 1:
+            st, pc = inc[0][0], inc[0][1]                   # plain continuation of the chain
+        elif len(inc) == 1:
+            st, pc = inc[0][0].copy(), inc[0][1]            # a fork: own state and node
+        else:
+            st = _merge_state([x for x, _g in inc], guards, memories, iso)
+            pc = _or_all(guards)
+
+        lifter = Lifter(st)
+        try:
+            (flow, pre_regs, pre_flags, writes, fwrites, loads, new_stores, reads,
+             flag_reads) = _lift_one(st, lifter, ins, node, raw, memo)
+        except Unsupported:
+            raise _Fallback("unsupported instruction")
+        step = Step(ins=ins, ip=node, raw=raw, flow=flow, writes=writes, flag_writes=fwrites,
+                    reads=reads, flag_reads=flag_reads, loads=loads, stores=new_stores,
+                    values={n: st.regs[n] for n in writes} | {f: st.flags[f] for f in fwrites},
+                    pre={n: pre_regs[n] for n in writes},
+                    esp_off=stack_offset(st.regs["esp"]),
+                    esp_off_before=stack_offset(pre_regs["esp"]), mem=st.mem)
+        steps[node] = step
+
+        edges: list[tuple[int, T.Term]] = []
+        if kind == "term" or flow.kind in ("indirect", "halt"):
+            step.kind = "term"
+            terminators.append(step)
+            exit_states[node] = st
+        elif kind == "jcc" and flow.kind == "branch":
+            step.kind = "jcc"                               # a real branch: always emitted
+            c = flow.cond
+            edges = [(flow.taken, T.and_(pc, c)), (flow.fall, T.and_(pc, T.not_(c)))]
+        elif kind == "jcc" and flow.kind == "jump":         # the condition folded
+            if flow.target != ins.next_ip:                  # always taken: emit a jump
+                step.kind = "jcc"
+                jmp = _make_jmp(node, flow.target)
+                if jmp is not None and len(_encode_instr(jmp, node)) <= len(raw):
+                    step.repl = [jmp]
+                    step.reads = frozenset()                # a jump reads no flags
+                    step.flag_reads = frozenset()
+            edges = [(flow.target, pc)]
+        elif flow.kind == "jump":
+            edges = [(flow.target, pc)]
+        else:
+            edges = [(ins.next_ip, pc)]
+        if any(t in cfg.bad for t, _g in edges):
+            raise _Fallback("a live edge runs into undecodable bytes")
+        step.edges = tuple((node_of(t), g) for t, g in edges)
+        for t, g in step.edges:
+            entry.setdefault(t, []).append((st if len(step.edges) == 1 else st.copy(), g))
+
+    # ---- finish ----------------------------------------------------------------------------
+    for s in steps.values():
+        s.succs = tuple(steps[t] for t, _g in s.edges if t in steps)
+        for t in s.succs:
+            t.preds = t.preds + (s,)
+
+    term = terminators[0] if len(terminators) == 1 else None
+    state = exit_states[terminators[0].ip] if terminators else st0
+    trace = Trace(start=cfg.start, steps=[steps[ip] for ip in sorted(steps)], state=state,
+                  stop=None, terminator=term)
+    trace.terminators = terminators
+    trace.exit_states = exit_states
+    trace.order = [steps[n] for n in topo if n in steps]
+    # every node a step stored into must be analysed - including the ones a state copy
+    # made at a fork (they are not in ``memories``)
+    mems: list = []
+    for m in memories + [s.mem for s in steps.values() if s.mem is not None]:
+        if all(m is not x for x in mems):
+            mems.append(m)
+    trace.memories = mems
+    trace.regions = sorted((lo, lo + len(steps[lo].raw)) for lo in regions)
+    for lo in sorted(regions):
+        members = regions[lo]
+        trace.keep.append((lo, lo + len(steps[lo].raw), bytes(steps[lo].raw),
+                           [specs[m][0] for m in members]))
+    trace._end = max((ip + len(sp[1]) for ip, sp in specs.items()), default=cfg.start)
+    cov = sorted((ip, ip + len(sp[1])) for ip, sp in specs.items())
+    trace.dead_bytes = [(a[1], b[0]) for a, b in zip(cov, cov[1:]) if a[1] < b[0]]
+    for t in terminators:
+        _terminator_reads(t, memo)
+    _set_dead_below(trace)
+    return trace
 
 
 # ===========================================================================================
@@ -516,44 +1095,58 @@ def slice_trace(trace: Trace, regs_out: Sequence[str], keep_unread_stores: bool 
     the older, smaller - but unsound - dead-store elimination: the emitted load then
     re-reads memory the dropped store was supposed to have written.
     """
-    steps, st = trace.steps, trace.state
-    complete = trace.terminator is not None
+    steps = trace.steps
+    complete = trace.stop is None and bool(trace.terminators)
+    all_stores = [s for mem in trace.memories for s in mem.stores]
 
     stats = {"stores_kept": 0, "stores_dropped": 0}
     if not complete:
         # the tail was not analysed - everything at the stop point may be observable
         live_regs = set(REG32)
         live_flags = set(FLAGS)
-        live_stores = {id(s) for s in st.mem.stores}
+        live_stores = {id(s) for s in all_stores}
     else:
-        final_off = stack_offset(st.regs["esp"]) if st.regs["esp"].op != "undef" else None
-        kept_stores, late_stores = st.mem.surviving_stores(final_off)
-        live_stores = {id(s) for s in kept_stores + late_stores}
-        live_stores |= {id(s) for s in st.mem.stores if s.pinned}
+        # each memory segment is eliminated on its own (its list runs in order, once,
+        # on every execution that contains it - see memory.py)
+        live_stores = set()
+        for mem in trace.memories:
+            kept_stores, late_stores = mem.surviving_stores(mem.dead_below)
+            live_stores.update(id(s) for s in kept_stores)
+            live_stores.update(id(s) for s in late_stores)
+        live_stores |= {id(s) for s in all_stores if s.pinned}
         if not keep_unread_stores:
             # aggressive: only stores that some load may read are observable
-            live_stores = {id(s) for s in st.mem.stores if s.pinned}
-        live_regs = set(regs_out) | set(trace.terminator.reads)
-        live_flags = set(trace.terminator.flag_reads)
+            live_stores = {id(s) for s in all_stores if s.pinned}
 
     # stores the memory model says must survive (observable bytes, or a load that
     # could not be forwarded) - the backward walk below only adds more
     required_stores = set(live_stores)
-    for step in reversed(steps):
+    live_in: dict[int, tuple[set, set]] = {}
+    for step in reversed(trace.order):
+        if step.kind == "term":
+            # the terminating instruction defines what is observable at this exit
+            live_regs = set(regs_out) | set(step.reads)
+            live_flags = set(step.flag_reads)
+        else:
+            live_regs, live_flags = set(), set()
+            for nxt in step.succs:
+                r, f = live_in.get(id(nxt), (set(), set()))
+                live_regs |= r
+                live_flags |= f
         step.live_regs_after = frozenset(live_regs)
         step.live_flags_after = frozenset(live_flags)
-        if step.kind == "term":
-            keep = True
+        if step.kind in ("term", "loop", "jcc"):
+            keep = True                    # a terminator, a live branch, a loop region
         elif step.absorbed:
             keep = False                   # its effect is already in an earlier step's rewrite
         else:
-            keep = (bool(step.writes & live_regs) or bool(step.flag_writes & live_flags)
+            keep = (step.force_keep or bool(step.writes & live_regs)
+                    or bool(step.flag_writes & live_flags)
                     or any(id(s) in live_stores for s in step.stores))
         step.kept = keep
         if keep:
             step.reason = ""
             step.esp_dropped = False
-        if keep:
             if step.kind == "term":
                 value_live = True
             else:
@@ -571,21 +1164,20 @@ def slice_trace(trace: Trace, regs_out: Sequence[str], keep_unread_stores: bool 
                 for load in step.loads:
                     for s in load.may_read:
                         live_stores.add(id(s))
-        if not keep:
-            if not step.esp_dropped and not step.absorbed:
-                bits = []
-                if step.writes:
-                    bits.append("writes " + ",".join(sorted(step.writes)))
-                if step.flag_writes:
-                    bits.append("flags " + ",".join(sorted(step.flag_writes)))
-                if step.stores:
-                    bits.append(f"{len(step.stores)} store(s)")
-                if step.kind == "noop-jump":
-                    bits.append("jump to next instruction")
-                step.reason = "dead (" + ("; ".join(bits) or "no effect") + ")"
-            continue
-    stats["stores_kept"] = sum(1 for s in st.mem.stores if id(s) in live_stores)
-    stats["stores_dropped"] = len(st.mem.stores) - stats["stores_kept"]
+        elif not step.esp_dropped and not step.absorbed:
+            bits = []
+            if step.writes:
+                bits.append("writes " + ",".join(sorted(step.writes)))
+            if step.flag_writes:
+                bits.append("flags " + ",".join(sorted(step.flag_writes)))
+            if step.stores:
+                bits.append(f"{len(step.stores)} store(s)")
+            if step.kind == "jump":
+                bits.append("jump to next instruction")
+            step.reason = "dead (" + ("; ".join(bits) or "no effect") + ")"
+        live_in[id(step)] = (live_regs, live_flags)
+    stats["stores_kept"] = sum(1 for s in all_stores if id(s) in live_stores)
+    stats["stores_dropped"] = len(all_stores) - stats["stores_kept"]
     stats["ins_total"] = len(steps)
     stats["ins_kept"] = sum(1 for s in steps if s.kept)
     stats["ins_dropped"] = stats["ins_total"] - stats["ins_kept"]
@@ -624,6 +1216,18 @@ def _materialize(reg: str, val: T.Term, entry: T.Term | None, xor_ok: bool) -> I
     return None
 
 
+def _is_fallthrough(s: Step) -> bool:
+    """Does the step continue at the address right after its own bytes?
+
+    Dropping such a step (its bytes become NOPs / it vanishes in compact mode) keeps
+    control flow intact; a real jump does not, so it may never be folded or dropped
+    silently - the transparency pass below keeps the ones whose fall-through differs.
+    """
+    if not s.edges:
+        return True                       # the linear engine: a chain by construction
+    return len(s.edges) == 1 and s.edges[0][0] == s.end
+
+
 def _fold_pass(trace: Trace, stats: dict, max_run: int = MAX_FOLD_RUN) -> int:
     """Collapse runs of kept instructions into direct register writes.
 
@@ -656,10 +1260,12 @@ def _fold_pass(trace: Trace, stats: dict, max_run: int = MAX_FOLD_RUN) -> int:
                 lo, hi = readers.get(id(src), (k, k))
                 readers[id(src)] = (min(lo, k), max(hi, k))
     count = 0
+    index = {id(s): k for k, s in enumerate(steps)}
     i, n = 0, len(steps)
     while i < n:
         s = steps[i]
-        if not s.kept or s.absorbed or s.kind or s.repl is not None:
+        if (not s.kept or s.absorbed or s.kind or s.repl is not None
+                or not _is_fallthrough(s)):
             i += 1
             continue
         if trace.in_keep(s.ip):               # a verbatim region is nobody's to rewrite
@@ -667,24 +1273,28 @@ def _fold_pass(trace: Trace, stats: dict, max_run: int = MAX_FOLD_RUN) -> int:
             continue
         win = _Run(steps, i, live_stores, required, readers)
         best = None
-        run = 0
-        j = i
-        while j < n:
-            s = steps[j]
-            if s.kind or trace.in_keep(s.ip):  # a jump/terminator/kept region: never across
-                break
-            if s.absorbed or not s.kept:      # dropped bytes are NOPs, a run may span them
-                j += 1
-                continue
-            if s.repl is not None or run >= max_run:
-                break
-            if not win.add(j):
-                break
-            run += 1
-            plan = win.plan(j)
+        if win.add(s):
+            plan = win.plan(i)
             if plan is not None:
-                best = (j, plan)
-            j += 1
+                best = (i, plan)
+            j = i
+            while j - i + 1 < max_run:
+                # the run only ever follows the one continuation of the previous
+                # instruction: a step another edge reaches is a join, not a chain
+                nxt = steps[j].succs[0] if len(steps[j].succs) == 1 else None
+                if nxt is None or nxt.kind or nxt.absorbed or not nxt.kept \
+                        or nxt.repl is not None or trace.in_keep(nxt.ip) \
+                        or not _is_fallthrough(nxt):
+                    break
+                if len(nxt.preds) != 1 or nxt.preds[0] is not steps[j]:
+                    break
+                k = index[id(nxt)]
+                if k != j + 1 or not win.add(nxt):
+                    break
+                j = k
+                plan = win.plan(j)
+                if plan is not None:
+                    best = (j, plan)
         if best is None or not _install(trace, i, best[0], best[1]):
             i += 1
             continue
@@ -708,8 +1318,7 @@ class _Run:
         self.flags: set[str] = set()
         self.moves: list[Store] = []            # stores the run would drop
 
-    def add(self, j: int) -> bool:
-        s = self.steps[j]
+    def add(self, s: Step) -> bool:
         for x in s.stores:
             if id(x) in self.required:
                 return False                    # observable (or blocking) - the run ends here
@@ -818,7 +1427,7 @@ def _drop_esp_runs(trace: Trace, stats: dict) -> int:
     no surviving store/load lives inside) removing them is invisible.
     """
     live_stores = stats["_live_stores"]
-    kept = [s for s in trace.steps if s.kept]
+    kept = [s for s in trace.order if s.kept]
     removed = 0
     run: list[Step] = []
 
@@ -837,13 +1446,67 @@ def _drop_esp_runs(trace: Trace, stats: dict) -> int:
         essential = (bool((s.writes - {"esp"}) & s.live_regs_after)
                      or bool(s.flag_writes & s.live_flags_after)
                      or any(id(x) in live_stores for x in s.stores)
-                     or s.kind == "term")
+                     or bool(s.kind) or not _is_fallthrough(s))
+        if run and not (len(s.preds) == 1 and s.preds[0] is run[-1]
+                        and _is_fallthrough(run[-1])):
+            flush()                             # not the continuation of the dance
         if essential or s.esp_off is None or s.esp_off_before is None:
             flush()
         else:
             run.append(s)
     flush()
     return removed
+
+
+def _emitted_ips(trace: Trace) -> list[int]:
+    """Addresses the output has real code at (kept steps and kept regions)."""
+    ips: list[int] = []
+    for s in trace.steps:
+        if s.kept and not s.absorbed and not trace.in_keep(s.ip):
+            ips.append(s.ip)
+    for lo, _hi, _data, instrs in trace.keep:
+        ip = lo
+        for ins in instrs:
+            ips.append(ip)
+            ip += ins.len
+    return sorted(ips)
+
+
+def _resolve_dropped(trace: Trace, by_ip: dict, ip: int, limit: int) -> int | None:
+    """Follow the runtime successors of dropped steps from ``ip`` to emitted code."""
+    for _ in range(limit):
+        s = by_ip.get(ip)
+        if s is None or s.kept or trace.in_keep(ip):
+            return ip
+        if len(s.edges) != 1:
+            return None
+        ip = s.edges[0][0]
+    return None
+
+
+def _transparency(trace: Trace) -> int:
+    """Keep a dropped jump whose fall-through no longer leads where it jumped.
+
+    Dropping an instruction only turns it into NOPs - execution falls through.  That
+    is only equivalent to the original when the first *emitted* instruction after it
+    is the one the dropped instruction would have continued at (a ``jmp``/``jcc``
+    whose successor is not its fall-through, e.g. a jump over the other arm).
+    """
+    fixed = 0
+    by_ip = {s.ip: s for s in trace.steps}
+    ips = _emitted_ips(trace)
+    for s in trace.steps:
+        if s.kept or s.absorbed or s.force_keep or len(s.edges) != 1:
+            continue
+        target = s.edges[0][0]
+        if target == s.end:
+            continue                                  # falls through to the same place
+        want = _resolve_dropped(trace, by_ip, target, len(trace.steps) + 2)
+        got = next((ip for ip in ips if ip >= s.end), None)
+        if want is None or want != got:
+            s.force_keep = True
+            fixed += 1
+    return fixed
 
 
 def mov_const(reg: str, value: int) -> Instruction:
@@ -912,6 +1575,50 @@ def emit_inplace(trace: Trace) -> bytes:
     return bytes(buf)
 
 
+# short branch code -> its near form (JECXZ has none: it is rel8 only)
+_NEAR_VARIANT = {}
+for _name in dir(Code):
+    if _name.endswith("_REL8_32"):
+        _near = getattr(Code, _name[:-len("_REL8_32")] + "_REL32_32", None)
+        if _near is not None:
+            _NEAR_VARIANT[int(getattr(Code, _name))] = _near
+
+
+def _branch_forms(ins: Instruction) -> tuple | None:
+    """``(short code, near code)`` for a branch, or None when the operand is not one."""
+    if not ins.op_count or ins.flow_control not in (FC.CONDITIONAL_BRANCH,
+                                                    FC.UNCONDITIONAL_BRANCH, FC.CALL):
+        return None
+    if ins.op_kind(0) not in (OK.NEAR_BRANCH16, OK.NEAR_BRANCH32, OK.NEAR_BRANCH64):
+        return None
+    return ins.code, _NEAR_VARIANT.get(int(ins.code), ins.code)
+
+
+def _encode_at(ins: Instruction, ip: int) -> bytes:
+    """Encode one instruction at ``ip`` in exactly the form it has (no relaxation)."""
+    enc = Encoder(32)
+    enc.encode(ins, ip)
+    return bytes(enc.take_buffer())
+
+
+def _make_branch(ins: Instruction, target: int, ip: int, allow_short: bool) -> Instruction:
+    """A branch like ``ins`` at ``ip`` jumping to ``target`` (never shrunk below its
+    current form, grown to the near form when the short one cannot reach)."""
+    forms = _branch_forms(ins)
+    if forms is None:
+        return ins
+    for code in (forms if allow_short else (forms[1],)):
+        try:
+            new = Instruction.create_branch(code, target)
+            new.ip = ip
+            data = _encode_at(new, ip)
+            if Decoder(32, data, ip=ip).decode().near_branch_target == target:
+                return new
+        except Exception:
+            continue
+    raise StubError(f"cannot retarget the branch at {ins.ip:#x} to {target:#x}")
+
+
 def compact_instrs(trace: Trace, upto: Step | None = None) -> list:
     """The instruction list a compact blob is built from: the surviving steps plus the
     kept regions, in address order (everything before ``upto`` when given)."""
@@ -930,17 +1637,95 @@ def compact_instrs(trace: Trace, upto: Step | None = None) -> list:
     return out
 
 
+def compact_layout(trace: Trace, instrs: list) -> tuple[bytes, dict[int, int]]:
+    """Lay the compact instructions out from ``trace.start`` and encode them.
+
+    Every branch is pointed at the new address of its target (a target that was
+    dropped resolves to the next surviving instruction the original would have
+    reached); a short branch that no longer reaches is grown to its near form.  The
+    layout is a single growth fixpoint, so the returned ``original -> new address``
+    map is exact - which is what locating the exits in the output needs.
+    """
+    by_ip: dict[int, int] = {}
+    for k, ins in enumerate(instrs):
+        by_ip.setdefault(ins.ip, k)
+    steps_by_ip = {s.ip: s for s in trace.steps}
+    targets: dict[int, int] = {}
+    for k, ins in enumerate(instrs):
+        if _branch_forms(ins) is None:
+            continue
+        target = ins.near_branch_target
+        j = by_ip.get(target)
+        if j is None:
+            resolved = _resolve_dropped(trace, steps_by_ip, target, len(trace.steps) + 2)
+            j = by_ip.get(resolved) if resolved is not None else None
+        if j is None:
+            raise StubError(f"the branch at {ins.ip:#x} points at {target:#x}, which is "
+                            f"not part of the compact output")
+        targets[k] = j
+    shortable = set()                                   # branches still in their short form
+    sizes: list[int] = []
+    for k, ins in enumerate(instrs):
+        forms = _branch_forms(ins)
+        if forms is not None and int(ins.code) != int(forms[1]):
+            shortable.add(k)
+            sizes.append(2)                             # the original short form
+        else:
+            sizes.append(len(_encode_at(ins, ins.ip)))
+    grown: set[int] = set()
+    new_ip: list[int] = []
+    while True:
+        addr = trace.start
+        new_ip = []
+        for k in range(len(instrs)):
+            new_ip.append(addr)
+            addr += sizes[k]
+        grew = False
+        for k, j in sorted(targets.items()):
+            if k not in shortable or k in grown:
+                continue
+            disp = new_ip[j] - (new_ip[k] + sizes[k])
+            if not -128 <= disp <= 127:
+                near = _make_branch(instrs[k], new_ip[j], new_ip[k], allow_short=False)
+                sizes[k] = len(_encode_at(near, new_ip[k]))
+                grown.add(k)
+                grew = True
+        if not grew:
+            break
+    out = bytearray()
+    newmap: dict[int, int] = {}
+    for k, ins in enumerate(instrs):
+        newmap[ins.ip] = new_ip[k]
+        if k in targets:
+            ins = _make_branch(ins, new_ip[targets[k]], new_ip[k],
+                               k in shortable and k not in grown)
+        data = _encode_at(ins, new_ip[k])
+        if len(data) != sizes[k]:                       # pragma: no cover - defensive
+            raise StubError(f"cannot lay out {ins} at {new_ip[k]:#x}")
+        out += data
+    return bytes(out), newmap
+
+
 def emit_compact(trace: Trace) -> bytes:
     """Only the surviving instructions, starting at the original start address."""
-    if trace.terminator is None:
+    if trace.stop is not None or not trace.terminators:
         raise StubError("analysis stopped early - compact output would invalidate addresses; "
                         "use inplace mode")
-    return bytes(_encode_instrs(compact_instrs(trace), trace.start))
+    return compact_layout(trace, compact_instrs(trace))[0]
 
 
 # ===========================================================================================
 # the result
 # ===========================================================================================
+@dataclasses.dataclass
+class Exit:
+    """One way the stub can end: the terminating instruction, where it lands in the
+    output, and the registers that have to match there."""
+    step: Step
+    out_ip: int | None
+    compare: tuple[str, ...]
+
+
 @dataclasses.dataclass
 class Result:
     start: int
@@ -954,6 +1739,7 @@ class Result:
     concrete: dict[str, int] = dataclasses.field(default_factory=dict)
     concrete_args: dict[int, int] = dataclasses.field(default_factory=dict)   # offset -> value
     concrete_mem: dict[int, int] = dataclasses.field(default_factory=dict)    # address -> value
+    exits: list[Exit] = dataclasses.field(default_factory=list)
 
     @property
     def kept_steps(self) -> list[Step]:
@@ -961,15 +1747,8 @@ class Result:
 
     @property
     def terminator_ip_out(self) -> int | None:
-        """Address of the terminating instruction in the emitted blob."""
-        from iced_x86 import BlockEncoder
-        term = self.trace.terminator
-        if term is None:
-            return None
-        if self.mode == "inplace":
-            return term.ip                       # dropped bytes become NOPs, addresses stay
-        prefix = compact_instrs(self.trace, upto=term)
-        return self.start + len(_encode_instrs(prefix, self.start))
+        """Address of the terminating instruction in the emitted blob (single exit)."""
+        return self.exits[0].out_ip if len(self.exits) == 1 else None
 
     @property
     def instructions(self) -> list[Instruction]:
@@ -1237,20 +2016,28 @@ def simplify(source, start: int, regs_in=(), regs_out=(), is_end: Callable | Non
 
     arg_slots = _norm_args(args)
     mem_slots = _norm_mem(mem)
+    ranges = _norm_keep(keep, start)
     trace = analyse(source, start, is_end or is_terminator, concrete=init, args=arg_slots,
-                    mem=mem_slots, max_instructions=max_instructions)
+                    mem=mem_slots, max_instructions=max_instructions, keep_ranges=ranges)
     if not trace.steps:
         raise StubError(f"nothing decoded at {start:#x}")
-    trace.keep = _read_keep(source, _norm_keep(keep, start), trace.end, mode)
+    if mode == "compact" and trace.regions:
+        raise StubError("a loop region has to be kept verbatim - only inplace output "
+                        "can hold it (use --mode inplace)")
+    trace.keep += _read_keep(source, ranges, trace.end, mode)
+    trace.keep.sort(key=lambda e: e[0])
     # slice <-> fold fixpoint: folding turns an instruction into "mov reg, const",
     # which can make earlier instructions dead, which enables more folding
     stats: dict = {}
-    for _ in range(8):
+    for _ in range(len(trace.steps) + 8):
         stats = slice_trace(trace, sorted(out), keep_unread_stores=keep_unread_stores,
                             protect_loaded_stores=protect_loaded_stores)
         n = (_fold_pass(trace, stats) if FOLD else 0) + (_drop_esp_runs(trace, stats) if ESP_RUNS else 0)
-        if n == 0:
+        fixed = _transparency(trace)    # dropping a jump must not change where control goes
+        if n == 0 and fixed == 0:
             break                       # slice and passes agree: fixpoint reached
+    else:                               # pragma: no cover - defensive
+        raise StubError("the simplified control flow does not settle")
     # the passes have the last word, so recount from the actual kept flags
     stats["ins_kept"] = sum(1 for s in trace.steps if s.kept)
     stats["ins_dropped"] = stats["ins_total"] - stats["ins_kept"]
@@ -1266,16 +2053,34 @@ def simplify(source, start: int, regs_in=(), regs_out=(), is_end: Callable | Non
                                  for a, t in sorted(mem_slots.items()))
     if trace.keep:
         stats["keep"] = ", ".join(f"[{lo:#x}-{hi:#x}]" for lo, hi, _, _ in trace.keep)
-    code = emit_inplace(trace) if mode == "inplace" else emit_compact(trace)
+    if mode == "inplace":
+        code, placed = emit_inplace(trace), None
+    else:
+        if trace.stop is not None or not trace.terminators:
+            raise StubError("analysis stopped early - compact output would invalidate "
+                            "addresses; use inplace mode")
+        code, placed = compact_layout(trace, compact_instrs(trace))
 
-    outputs = {n: trace.state.regs[n] for n in sorted(out)}
-    compare = set(out)
-    if trace.terminator is not None:
-        for n in sorted(trace.terminator.reads):
-            outputs.setdefault(f"{n} (exit)", trace.state.regs[n])
-            compare.add(n)
+    def _out_ip(term: Step) -> int | None:
+        return term.ip if placed is None else placed.get(term.ip)
+
+    exits = [Exit(step=t, out_ip=_out_ip(t), compare=tuple(sorted(set(out) | set(t.reads))))
+             for t in trace.terminators]
+    single = len(exits) == 1
+    outputs: dict = {}
+    for e in exits:
+        st = trace.exit_states[e.step.ip]
+        for n in sorted(out):
+            outputs[n if single else f"{n} @{e.step.ip:#x}"] = st.regs[n]
+        for n in sorted(e.step.reads):
+            outputs[f"{n} (exit)" if single else f"{n} (exit {e.step.ip:#x})"] = st.regs[n]
+    if not exits:                                    # the analysis stopped early
+        for n in sorted(out):
+            outputs[n] = trace.state.regs[n]
+    compare = {n for e in exits for n in e.compare} | set(out)
     return Result(start=start, end=trace.end, mode=mode, code=code, trace=trace,
                   stats=stats, outputs=outputs, compare_regs=tuple(sorted(compare)),
                   concrete=dict(init),                 # register values the result assumes
                   concrete_args={off: t.val for off, t in arg_slots.items() if t.op == "c"},
-                  concrete_mem={a: t.val for a, t in mem_slots.items() if t.op == "c"})
+                  concrete_mem={a: t.val for a, t in mem_slots.items() if t.op == "c"},
+                  exits=exits)

@@ -5,16 +5,23 @@ deterministic pseudo random bytes derived from (seed, page address).  Two runs
 with the same seed therefore see exactly the same memory, which makes the
 original code and the simplified code directly comparable - even when pointers
 are random garbage.
+
+The same goes for the clock: ``rdtsc`` is the one instruction whose result is not
+a function of the machine state, so it is hooked and given a deterministic,
+monotonic value per run (derived from the seed).  Stubs that read the time stamp
+counter - a favourite of obfuscators - stay comparable, and one that *spins* until
+the counter moves still terminates.
 """
 from __future__ import annotations
 
 import random
 
-from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_HOOK_MEM_UNMAPPED, UC_HOOK_MEM_WRITE,
-                     UC_PROT_ALL)
+from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_HOOK_CODE, UC_HOOK_MEM_UNMAPPED,
+                     UC_HOOK_MEM_WRITE, UC_PROT_ALL)
 from unicorn import x86_const as X
 
 PAGE = 0x1000
+RDTSC_OPCODE = b"\x0f\x31"
 REGS = {"eax": X.UC_X86_REG_EAX, "ecx": X.UC_X86_REG_ECX, "edx": X.UC_X86_REG_EDX,
         "ebx": X.UC_X86_REG_EBX, "esp": X.UC_X86_REG_ESP, "ebp": X.UC_X86_REG_EBP,
         "esi": X.UC_X86_REG_ESI, "edi": X.UC_X86_REG_EDI, "eflags": X.UC_X86_REG_EFLAGS,
@@ -55,8 +62,11 @@ class Emu:
         self._code_images: list[tuple[int, bytes]] = []
         self.write_log: list[tuple[int, int]] = []
         self._filling = False                 # the mapper's own mem_writes are not program writes
+        self.tsc = (seed * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF   # deterministic rdtsc
+        self._tsc_pending = False
         self.uc.hook_add(UC_HOOK_MEM_UNMAPPED, lambda *a: Emu._unmapped(self, *a))
         self.uc.hook_add(UC_HOOK_MEM_WRITE, lambda *a: Emu._on_write(self, *a))
+        self.uc.hook_add(UC_HOOK_CODE, lambda *a: Emu._on_code(self, *a))
         for base, data in (code or {}).items():
             self.map_code(base, data)
 
@@ -105,6 +115,30 @@ class Emu:
                     content[lo - p:hi - p] = data[lo - base:hi - base]
             self._write_raw(p, bytes(content))
 
+    def _on_code(self, uc, address, size, user):
+        """Give ``rdtsc`` a deterministic, monotonic value (see the module docstring).
+
+        The code hook runs *before* its instruction, so the value is written just
+        before the *next* one (or by :meth:`settle` when the caller looks at the
+        state) - writing it here would be overwritten by the real ``rdtsc``.
+        """
+        if self._tsc_pending:
+            self._tsc_pending = False
+            self._write_tsc()
+        if size == 2 and self.read(address, 2) == RDTSC_OPCODE:
+            self.tsc = (self.tsc + 0x40) & 0xFFFFFFFFFFFFFFFF
+            self._tsc_pending = True
+
+    def _write_tsc(self) -> None:
+        self.uc.reg_write(X.UC_X86_REG_EAX, self.tsc & 0xFFFFFFFF)
+        self.uc.reg_write(X.UC_X86_REG_EDX, self.tsc >> 32)
+
+    def settle(self) -> None:
+        """Apply a pending ``rdtsc`` result (the run may have stopped right after one)."""
+        if self._tsc_pending:
+            self._tsc_pending = False
+            self._write_tsc()
+
     def reset(self, seed: int | None = None) -> None:
         """Restore every mapped page to its pristine content for ``seed``.
 
@@ -114,6 +148,8 @@ class Emu:
         """
         if seed is not None:
             self.seed = seed
+        self.tsc = (self.seed * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        self._tsc_pending = False
         for p in sorted(self.pages):
             if self.page_kind.get(p) == "code":
                 continue
@@ -151,6 +187,7 @@ class Emu:
             self.uc.reg_write(REGS[n], v & 0xFFFFFFFF)
 
     def get_state(self) -> dict[str, int]:
+        self.settle()
         return {n: self.uc.reg_read(r) for n, r in REGS.items()}
 
     def run(self, start: int, until: int, max_insns: int = 200000, count: int = 0) -> None:

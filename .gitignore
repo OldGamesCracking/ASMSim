@@ -1,3 +1,5 @@
 /out
 /tests/__pycache__
 /.vscode
+/asmsim/__pycache__
+/tools/__pycache__

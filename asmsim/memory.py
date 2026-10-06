@@ -10,6 +10,22 @@ The model is deliberately simple and conservative:
   (constant) addresses never alias the stack at all.
 * a load that cannot be forwarded from a store becomes a ``load`` term tagged
   with the id of the last store that might have affected it.
+
+With conditional branches a single flat chain is no longer enough: two paths may
+have written different things before they meet again.  Memory therefore is a
+persistent tree of *segments*, each segment a normal store chain on top of one
+of three links:
+
+``base``    the chain this segment extends (an ordinary continuation);
+``join``    ``(cond, A, B)`` - the state of a merge: a load forwards only when
+            both arms would produce the *identical* term, otherwise it stays
+            opaque and both arms' candidate stores are pinned;
+``barrier`` a loop region: the loop may have written anything, so every load is
+            opaque; the pre-loop stores it may alias are pinned.
+
+Each segment's ``stores`` list is executed in order, once, on every execution
+that contains it - which is what lets the dead-store analysis stay path-local
+(see :meth:`surviving_stores`).
 """
 from __future__ import annotations
 
@@ -64,8 +80,15 @@ DECL_SIZE = 4       # a declared stack argument / memory value is one dword
 
 
 class Memory:
-    def __init__(self, isolate_new_stack: bool = True):
+    def __init__(self, isolate_new_stack: bool = True, *, base: "Memory | None" = None,
+                 join: tuple | None = None, barrier: "Memory | None" = None):
         self.stores: list[Store] = []
+        self.base = base
+        self.join = join              # (cond, Memory, Memory)
+        self.barrier = barrier        # Memory
+        self.token = T.next_uid()     # identity of this memory state (opaque loads)
+        self.dead_below: int | None = None    # set by the analysis; None = no elimination
+        self.last_step = None         # the last step that stored into this segment
         self.isolate_new_stack = isolate_new_stack
         # declared stack arguments: byte offset from the entry ESP -> the term the
         # slot holds (the argument's input term, or a constant when one was given)
@@ -74,10 +97,12 @@ class Memory:
         self.mem_slots: dict[int, T.Term] = {}
 
     def copy(self) -> "Memory":
-        m = Memory(self.isolate_new_stack)
+        m = Memory(self.isolate_new_stack, base=self.base, join=self.join,
+                   barrier=self.barrier)
         m.stores = list(self.stores)
-        m.arg_slots = dict(self.arg_slots)
-        m.mem_slots = dict(self.mem_slots)
+        m.dead_below = self.dead_below
+        m.arg_slots = self.arg_slots
+        m.mem_slots = self.mem_slots
         return m
 
     # ------------------------------------------------------------------
@@ -104,6 +129,19 @@ class Memory:
                 return DISJOINT
         return UNKNOWN
 
+    def _forward(self, s: Store, addr: T.Term, nbytes: int) -> T.Term:
+        """The value a covering store ``s`` supplies to a read at ``addr``."""
+        bits = nbytes * 8
+        _, so = split(s.addr)
+        _, lo = split(addr)
+        d = lo - so
+        v = s.val
+        if d == 0 and s.size == nbytes:
+            return v
+        if d:
+            v = T.shr(v, T.const(8 * d, 8))
+        return T.trunc(v, bits) if v.bits != bits else v
+
     def load(self, seg, addr: T.Term, nbytes: int) -> T.Term:
         bits = nbytes * 8
         chain = self.stores
@@ -113,21 +151,28 @@ class Memory:
             if rel == DISJOINT:
                 continue
             if rel == COVERS:
-                _, so = split(s.addr)
-                _, lo = split(addr)
-                d = lo - so
-                v = s.val
-                if d == 0 and s.size == nbytes:
-                    return v
-                if d:
-                    v = T.shr(v, T.const(8 * d, 8))
-                return T.trunc(v, bits) if v.bits != bits else v
+                return self._forward(s, addr, nbytes)
             # blocked: the value depends on memory contents we cannot forward
             s.pinned = True
             for j in range(k):
                 if self.relation(chain[j], seg, addr, nbytes) != DISJOINT:
                     chain[j].pinned = True
             return T.load(seg, addr, s.seq, bits)
+        if self.join is not None:                       # both arms must agree
+            _cond, a_mem, b_mem = self.join
+            a = a_mem.load(seg, addr, nbytes)
+            b = b_mem.load(seg, addr, nbytes)
+            if a is b:
+                return a
+            for s in a_mem.may_read(seg, addr, nbytes) + b_mem.may_read(seg, addr, nbytes):
+                s.pinned = True
+            return T.load(seg, addr, self.token, bits)
+        if self.barrier is not None:                    # a loop may have written anything
+            for s in self.barrier.may_read(seg, addr, nbytes):
+                s.pinned = True
+            return T.load(seg, addr, self.token, bits)
+        if self.base is not None:
+            return self.base.load(seg, addr, nbytes)
         if seg is None:                     # nothing was stored here - a declaration?
             declared = self.mem_at(addr, bits)
             if declared is not None:
@@ -177,7 +222,9 @@ class Memory:
         when it covers the read; if the read is only partially covered (or the
         relation is unknown) every older store that may contribute is included.
         Stores that are already overwritten by a newer one are *not* dependencies -
-        which is what makes dead-store elimination cascade.
+        which is what makes dead-store elimination cascade.  Segments above the one
+        that supplies the value (joins, barriers, bases) contribute their own
+        candidates: over-approximating here only ever keeps more stores alive.
         """
         chain = self.stores
         for k in range(len(chain) - 1, -1, -1):
@@ -188,6 +235,13 @@ class Memory:
             if rel == COVERS:
                 return (s,)
             return tuple(x for x in chain[:k + 1] if self.relation(x, seg, addr, nbytes) != DISJOINT)
+        if self.join is not None:
+            _cond, a_mem, b_mem = self.join
+            return (a_mem.may_read(seg, addr, nbytes) + b_mem.may_read(seg, addr, nbytes))
+        if self.barrier is not None:
+            return self.barrier.may_read(seg, addr, nbytes)
+        if self.base is not None:
+            return self.base.may_read(seg, addr, nbytes)
         return ()
 
     def store(self, seg, addr: T.Term, nbytes: int, val: T.Term) -> Store:
@@ -197,25 +251,32 @@ class Memory:
         return s
 
     # ------------------------------------------------------------------
-    def surviving_stores(self, final_esp_off):
-        """Dead-store elimination for the stack.
+    def surviving_stores(self, dead_below: int | None):
+        """Dead-store elimination for one segment's own store chain.
 
         Returns ``(kept, late)``: ``kept`` are stores that must be emitted in
         program order; ``late`` are stores into the stub's own new stack area
         (entirely below the entry ESP, still above the final ESP) which can be
-        emitted at the very end.  ``final_esp_off`` is the final ESP relative to
-        the entry ESP, or ``None`` when ESP is not a plain offset (then nothing
-        is eliminated).
+        emitted at the very end.  ``dead_below`` is the lowest address (relative
+        to the entry ESP) still observable anywhere this segment's execution can
+        reach, or ``None`` when that cannot be established (then nothing is
+        eliminated).
+
+        Sound per segment because the segment's list is executed in exactly this
+        order, once, on every execution that contains it; nothing in it may be
+        "covered" by a store in another segment (a different path, or a later
+        one), and callers keep the survivors of every segment.
         """
         stores = self.stores
-        if final_esp_off is None:
+        if dead_below is None:
             return list(stores), []
+        # only the stub's own frame (below the entry ESP) can be eliminated
+        dead_below = min(dead_below, 0)
         needed = [False] * len(stores)
         covered: set[int] = set()
         # A byte is dead when the stack pointer ended above it *and* it is below
         # the entry ESP - only that part is the stub's own frame.  Memory at or
         # above the entry ESP belongs to the caller, however far ESP moved.
-        dead_below = min(final_esp_off, 0)
         for idx in range(len(stores) - 1, -1, -1):
             s = stores[idx]
             off = stack_offset(s.addr) if s.seg is None else None
