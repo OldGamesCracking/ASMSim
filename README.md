@@ -1,4 +1,4 @@
-**Note: This is a purely vibe coded library, I take no response for it! Do whatever you like with it, but use it on you own risk only.**
+**Note: This is a purely vibe coded library, I take no responsability for it! Do whatever you like with it, but use it on you own risk only.**
 
 # ASMSim - A x86 assembly code simplifier/deobfuscator
 

@@ -1282,14 +1282,20 @@ def _fold_pass(trace: Trace, stats: dict, max_run: int = MAX_FOLD_RUN) -> int:
                 # the run only ever follows the one continuation of the previous
                 # instruction: a step another edge reaches is a join, not a chain
                 nxt = steps[j].succs[0] if len(steps[j].succs) == 1 else None
-                if nxt is None or nxt.kind or nxt.absorbed or not nxt.kept \
-                        or nxt.repl is not None or trace.in_keep(nxt.ip) \
+                if nxt is None or nxt.kind or nxt.absorbed or trace.in_keep(nxt.ip) \
                         or not _is_fallthrough(nxt):
                     break
                 if len(nxt.preds) != 1 or nxt.preds[0] is not steps[j]:
                     break
                 k = index[id(nxt)]
-                if k != j + 1 or not win.add(nxt):
+                if k != j + 1:
+                    break
+                if not nxt.kept:
+                    # dropped code in between: its bytes are NOPs and nothing live
+                    # depends on it, so the run may simply reach across it
+                    j = k
+                    continue
+                if not win.add(nxt):
                     break
                 j = k
                 plan = win.plan(j)

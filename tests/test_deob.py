@@ -874,6 +874,52 @@ def test_a_constant_condition_removes_the_dead_arm():
     assert verify(src, taken_jump, runs=20).ok
 
 
+def test_a_fold_reaches_across_dead_instructions():
+    """``mov cl, x`` / dead junk / ``xor cl, y`` collapses into one literal write.
+
+    The instruction in between is dropped, but it still sits between the two writes
+    in the byte stream: the run has to reach across it for the first write to die.
+    """
+    a = _Asm(STUB_BASE)
+    a.op(asm.mov(asm.reg("ecx", 8), asm.imm(0x22)))
+    a.op(asm.alu("xor", asm.reg("esi"), asm.reg("edi")))     # only dead registers
+    a.op(asm.alu("xor", asm.reg("ecx", 8), asm.imm(0x3A)))
+    a.op(_jmp("ebx"))
+    src = _estub(a.build())
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["ecx"])
+    moves = [asm.fmt(i) for s in res.kept_steps for i in s.instrs()
+             if asm.fmt(i).startswith("mov cl")]
+    assert moves == ["mov cl, 0x18"], res.listing()
+    rep = verify(src, res, runs=20)
+    assert rep.ok, str(rep)
+
+
+def _repeated_partial_writes(res):
+    """Consecutive emitted ``mov <8/16 bit view>, <literal>`` of the same view.
+
+    Whenever the fold can collapse such a pair (the second write fully overwrites the
+    field the first one set) the first is dead and must be gone; a leftover shows up
+    exactly as the ``mov cl, x`` before a folded ``mov cl, y``.
+    """
+    views = {"al", "cl", "dl", "bl", "ah", "ch", "dh", "bh",
+             "ax", "cx", "dx", "bx", "si", "di", "bp", "sp"}
+    out: list[str] = []
+    prev = None
+    for s in res.kept_steps:
+        for ins in s.instrs():
+            txt = asm.fmt(ins)
+            view = None
+            if txt.startswith("mov ") and "," in txt:
+                dst, _, val = txt[4:].partition(",")
+                val = val.strip()
+                if dst.strip() in views and (val.startswith("0x") or val.isdigit()):
+                    view = dst.strip()
+            if view is not None and view == prev:
+                out.append(txt)
+            prev = view
+    return out
+
+
 def test_a_loop_with_an_exit_inside_its_span_stops():
     """A ret between the loop head and its back edge is not a contiguous region."""
     a = _Asm(STUB_BASE)
@@ -925,6 +971,7 @@ def test_branchy_handler_inplace(src):
     assert sum(1 for s in res.kept_steps if s.kind == "jcc") == 1
     assert res.stats["ins_kept"] < res.stats["ins_total"] / 2
     assert len(res.code) == res.end - res.start
+    assert _repeated_partial_writes(res) == []           # no dead partial writes left
     rep = verify(src, res, runs=40)
     assert rep.ok, str(rep)
 
@@ -934,6 +981,7 @@ def test_branchy_handler_compact_reaches_both_arms(src):
     assert res.trace.stop is None
     assert res.terminator_ip_out is not None
     assert len(res.code) < res.end - res.start            # compact is smaller
+    assert _repeated_partial_writes(res) == []
     rep = verify(src, res, runs=60)
     assert rep.ok, str(rep)
     # the branch is real: over these seeds the original walks both arms
