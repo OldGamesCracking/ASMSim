@@ -116,8 +116,7 @@ def _prepare(image: dict[int, bytes], stops: dict[int, int], seed: int,
             key = stops.get(ip)
             if key is not None:
                 return key
-            emu.uc.emu_start(ip, 0, count=1)
-            ip = emu.uc.reg_read(eip)
+            ip = emu.step(ip)
         raise RuntimeError(f"never reached any of {[hex(x) for x in stops]}")
 
     emu.execute = run                                   # type: ignore[attr-defined]

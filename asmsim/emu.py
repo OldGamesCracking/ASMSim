@@ -16,9 +16,14 @@ from __future__ import annotations
 
 import random
 
+from iced_x86 import Decoder
+from iced_x86 import Mnemonic as MN
+from iced_x86 import OpKind as OK
 from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_HOOK_CODE, UC_HOOK_MEM_UNMAPPED,
                      UC_HOOK_MEM_WRITE, UC_PROT_ALL)
 from unicorn import x86_const as X
+
+from .lift import SEGINFO
 
 PAGE = 0x1000
 RDTSC_OPCODE = b"\x0f\x31"
@@ -194,6 +199,36 @@ class Emu:
         self.write_log.clear()
         self.ensure(start, 1)
         self.uc.emu_start(start, until, count=count or max_insns)
+
+    def step(self, ip: int) -> int:
+        """Execute one instruction; returns the next EIP.
+
+        Unicorn cannot load a segment register - its selectors start at zero and it
+        has no GDT, so ``pop ss`` (and friends) raise a #GP that a real flat 32-bit
+        process never sees.  Depending on its translation cache, unicorn either
+        raises or quietly skips such an instruction; either way it is executed here
+        as its stack effect alone, which is what the symbolic model does with it too
+        (it ignores selector values entirely).
+        """
+        esp0 = self.uc.reg_read(X.UC_X86_REG_ESP)
+        err = None
+        try:
+            self.uc.emu_start(ip, 0, count=1)
+        except UcError as e:
+            err = e
+        nxt = self.uc.reg_read(X.UC_X86_REG_EIP)
+        if err is None and nxt != ip:
+            return nxt
+        ins = Decoder(32, self.read(ip, 15), ip=ip).decode()
+        if (ins.len > 0 and ins.mnemonic == MN.POP and ins.op_kind(0) == OK.REGISTER
+                and ins.op_register(0) in SEGINFO):
+            self.uc.reg_write(X.UC_X86_REG_ESP,
+                              (esp0 + ins.stack_pointer_increment) & 0xFFFFFFFF)
+            self.uc.reg_write(X.UC_X86_REG_EIP, ins.next_ip)
+            return ins.next_ip
+        if err is not None:
+            raise err
+        return nxt                                   # no progress: let the caller guard
 
     def written_bytes(self) -> dict[int, int]:
         out = {}

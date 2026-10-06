@@ -1683,19 +1683,37 @@ def _make_branch(ins: Instruction, target: int, ip: int, allow_short: bool) -> I
 
 def compact_instrs(trace: Trace, upto: Step | None = None) -> list:
     """The instruction list a compact blob is built from: the surviving steps plus the
-    kept regions, in address order (everything before ``upto`` when given)."""
-    out: list[Instruction] = []
+    kept regions, in address order (everything before ``upto`` when given).
+
+    Every instruction is given the address of the step it stands for, so the layout
+    can key on ``.ip``: a branch can only ever name a step's *first* instruction, and
+    the extra instructions of a multi instruction replacement share that address.
+    (``BlockEncoder``/``Formatter`` address instructions by position, not by ``.ip``,
+    so this is only about telling the layout what a branch target refers to.)
+    """
+    pieces: list[tuple[int, Instruction]] = []
     pending = list(trace.keep)
     for step in trace.steps:
         while pending and step.ip >= pending[0][1]:     # the region comes before this step
-            out += pending.pop(0)[3]
+            ip, instrs = pending[0][0], pending.pop(0)[3]
+            for ins in instrs:
+                pieces.append((ip, ins))
+                ip += ins.len
         if step is upto:
             break
         if step.kept and not trace.in_keep(step.ip):
-            out += step.instrs()
+            pieces += [(step.ip, ins) for ins in step.instrs()]
     if upto is None:
-        for _, _, _, instrs in pending:
-            out += instrs
+        for lo, _hi, _data, instrs in pending:
+            ip = lo
+            for ins in instrs:
+                pieces.append((ip, ins))
+                ip += ins.len
+    out = []
+    for ip, ins in pieces:
+        if ins.ip != ip:
+            ins.ip = ip
+        out.append(ins)
     return out
 
 
@@ -1712,6 +1730,17 @@ def compact_layout(trace: Trace, instrs: list) -> tuple[bytes, dict[int, int]]:
     for k, ins in enumerate(instrs):
         by_ip.setdefault(ins.ip, k)
     steps_by_ip = {s.ip: s for s in trace.steps}
+    # The list is in address order (that is what keeps every fall-through edge adjacent),
+    # but a stub can call code that sits *before* its entry - then the blob would start
+    # at the callee.  Prepend a jump so executing the blob at ``start`` runs the entry.
+    entry = _resolve_dropped(trace, steps_by_ip, trace.start, len(trace.steps) + 2)
+    if entry is not None and instrs and instrs[0].ip != entry:
+        jump = Instruction.create_branch(Code.JMP_REL32_32, entry)
+        jump.ip = max(by_ip) + 1            # above every real address: never a target
+        instrs = [jump] + instrs
+        by_ip = {}
+        for k, ins in enumerate(instrs):
+            by_ip.setdefault(ins.ip, k)
     targets: dict[int, int] = {}
     for k, ins in enumerate(instrs):
         if _branch_forms(ins) is None:

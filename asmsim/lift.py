@@ -40,6 +40,10 @@ for _i, _n in enumerate(["al", "cl", "dl", "bl"]):
 for _i, _n in enumerate(["ah", "ch", "dh", "bh"]):
     REGINFO[getattr(R, _n.upper())] = (REG32[_i], 8, 8)
 
+# segment registers: never compared or folded on, only pushed and popped.  Their
+# selector values are not part of the model, so a ``push seg`` pushes an unknown.
+SEGINFO = {getattr(R, n.upper()): n for n in ("ds", "es", "ss", "cs", "fs", "gs")}
+
 CCNAMES = {getattr(CC, n.upper()): n for n in
            ("o", "no", "b", "ae", "e", "ne", "be", "a", "s", "ns", "p", "np", "l", "ge", "le", "g")}
 CC_FLAGS = {"o": ("of",), "no": ("of",), "b": ("cf",), "ae": ("cf",), "e": ("zf",), "ne": ("zf",),
@@ -877,6 +881,9 @@ def _stos(L, ins):
 def _push(L, ins):
     if ins.stack_pointer_increment != -4:
         raise Unsupported(ins, "16 bit push / segment register push")
+    if ins.op_kind(0) == OK.REGISTER and ins.op_register(0) in SEGINFO:
+        L.push_val(T.undef(32))    # a selector: unknown, and never assumed to be anything
+        return
     s = L.operand(ins, 0, 32)
     if s.bits != 32:
         raise Unsupported(ins, "16 bit push")
@@ -885,8 +892,12 @@ def _push(L, ins):
 
 @handles("POP")
 def _pop(L, ins):
-    if ins.stack_pointer_increment != 4 or (
-            ins.op_kind(0) == OK.REGISTER and REGINFO.get(ins.op_register(0), (0, 0))[1] != 32):
+    if ins.stack_pointer_increment != 4:
+        raise Unsupported(ins, "16 bit pop / segment register")
+    if ins.op_kind(0) == OK.REGISTER and ins.op_register(0) in SEGINFO:
+        L.pop_val()                # writing a selector changes nothing that is modelled
+        return
+    if ins.op_kind(0) == OK.REGISTER and REGINFO.get(ins.op_register(0), (0, 0))[1] != 32:
         raise Unsupported(ins, "16 bit pop / segment register")
     v = L.pop_val()
     d = L.operand(ins, 0)          # a memory destination uses the ESP *after* the increment

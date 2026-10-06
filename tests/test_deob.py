@@ -963,6 +963,45 @@ def test_a_fold_across_dead_code_still_respects_the_flags():
     assert rep.ok, str(rep)
 
 
+def test_segment_register_filler_is_tolerated():
+    """``push ss`` / ``pop ss`` junk - the VM sprinkles it in, and the fixture's
+    0x114A8EB stops dead on it without support.
+
+    The selector is never modelled (pushing it pushes an unknown, popping it changes
+    nothing that is modelled), so all that is left of the pair is its stack effect -
+    which the lifter models and the reference emulator performs by hand, since unicorn
+    cannot load a segment register at all.
+    """
+    a = _Asm(STUB_BASE)
+    a.op(asm.mov(asm.reg("ecx"), asm.imm(0x1234)))
+    a.op(Instruction.create_reg(Code.PUSHD_SS, Register.SS),
+         Instruction.create_reg(Code.POPD_SS, Register.SS))
+    a.op(Instruction.create(Code.PUSHFD),
+         Instruction.create_reg(Code.POP_R32, Register.EAX))
+    a.op(_jmp("ebx"))
+    src = _estub(a.build())
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax", "ecx"])
+    assert res.trace.stop is None
+    text = _instructions_only(res)
+    assert "push ss" not in text and "pop ss" not in text      # pure stack effect
+    rep = verify(src, res, runs=25)         # 25 runs: the emulator is reused throughout
+    assert rep.ok, str(rep)
+
+
+def test_a_stub_that_calls_backwards_still_verifies_compacted(src):
+    """The fixture's 0x114C000 calls a helper at 0x114BFB0 - *before* its entry.
+
+    A compact blob is laid out in address order (that is what keeps fall-through
+    edges adjacent), so without care the blob would begin with the helper; it has to
+    start with a jump to the entry instead.
+    """
+    for mode in ("inplace", "compact"):
+        res = simplify(src, 0x114C000, regs_out=["eax"], mode=mode)
+        assert res.trace.stop is None
+        rep = verify(src, res, runs=30)
+        assert rep.ok, f"{mode}: {rep}"
+
+
 def _repeated_partial_writes(res):
     """Consecutive emitted ``mov <8/16 bit view>, <literal>`` of the same view.
 
