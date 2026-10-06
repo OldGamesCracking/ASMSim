@@ -894,6 +894,75 @@ def test_a_fold_reaches_across_dead_instructions():
     assert rep.ok, str(rep)
 
 
+def _instructions_only(res) -> str:
+    """The listing's instructions, without the annotations (they quote the originals)."""
+    kept = res.listing(show_dropped=False)
+    return "\n".join(line.split(";")[0] for line in kept.splitlines())
+
+
+def test_an_arithmetic_chain_folds_its_constants():
+    """``mov edi, 0x15`` / ``add edi, ebx`` / ``sub edi, 5`` -> ``mov edi, ebx`` /
+    ``add edi, 0x10``: the constants are folded together across the chain."""
+    a = _Asm(STUB_BASE)
+    a.op(asm.mov(asm.reg("edi"), asm.imm(0x15)))
+    a.op(asm.alu("add", asm.reg("edi"), asm.reg("ebx")))
+    a.op(asm.alu("sub", asm.reg("edi"), asm.imm(5)))
+    a.op(_jmp("eax"))
+    src = _estub(a.build())
+    res = simplify(src, STUB_BASE, regs_in=["eax", "ebx"], regs_out=["edi"])
+    text = _instructions_only(res)                      # the notes mention the originals
+    assert "mov edi, ebx" in text and "add edi, 0x10" in text
+    assert "sub edi, 5" not in text and "mov edi, 0x15" not in text
+    rep = verify(src, res, runs=30)
+    assert rep.ok, str(rep)
+
+
+def test_an_arithmetic_chain_keeps_its_flags_when_they_are_used():
+    """The same chain, but a later ``sete`` reads the ``sub``'s ZF: it must survive.
+
+    The ``mov``/``add`` pair may still fold (it keeps the very same sum, so the very
+    same flags), but the ``sub`` is what sets the flags the ``sete`` consumes, so the
+    run that would fold it away has to be refused.
+    """
+    a = _Asm(STUB_BASE)
+    a.op(asm.mov(asm.reg("edi"), asm.imm(0x15)))
+    a.op(asm.alu("add", asm.reg("edi"), asm.reg("ebx")))
+    a.op(asm.alu("sub", asm.reg("edi"), asm.imm(5)))
+    a.op(asm.setcc("e", asm.reg("ecx", 8)))                   # reads ZF
+    a.op(_jmp("eax"))
+    src = _estub(a.build())
+    res = simplify(src, STUB_BASE, regs_in=["eax", "ebx"], regs_out=["edi", "ecx"])
+    text = _instructions_only(res)
+    assert "sub edi, 5" in text and "sete cl" in text
+    rep = verify(src, res, runs=30)                          # cl is an output: ZF compared
+    assert rep.ok, str(rep)
+
+
+def test_a_fold_across_dead_code_still_respects_the_flags():
+    """A run whose ``xor`` sets a *needed* flag must not collapse into a bare mov.
+
+    Same shape as the handler's ``mov cl, x`` / dead junk / ``xor cl, y`` - but the
+    low byte comes from a register (so the flag is not statically known) and a later
+    ``sete`` reads ZF: replacing the run would drop that definition, so it has to be
+    refused.  (With a literal first write the flag *is* known - ZF == 0 - and the
+    pass instead folds the ``sete`` to ``mov bl, 0`` and then the run, which is fine.)
+    """
+    a = _Asm(STUB_BASE)
+    a.op(asm.mov(asm.reg("ecx", 8), asm.reg("edx", 8)))      # symbolic low byte
+    a.op(asm.alu("xor", asm.reg("esi"), asm.reg("edi")))     # dead junk in between
+    a.op(asm.alu("xor", asm.reg("ecx", 8), asm.imm(0x3A)))
+    a.op(asm.setcc("e", asm.reg("ebx", 8)))                  # reads ZF
+    a.op(_jmp("eax"))
+    src = _estub(a.build())
+    res = simplify(src, STUB_BASE, regs_in=["eax"], regs_out=["ecx", "ebx"])
+    listing = res.listing().lower()
+    assert "mov cl, dl" in listing                       # the first write survives
+    assert "xor cl, 0x3a" in listing                     # ... and so does the xor
+    assert not any(s.rewritten for s in res.kept_steps)
+    rep = verify(src, res, runs=30)                      # bl is an output: ZF is compared
+    assert rep.ok, str(rep)
+
+
 def _repeated_partial_writes(res):
     """Consecutive emitted ``mov <8/16 bit view>, <literal>`` of the same view.
 

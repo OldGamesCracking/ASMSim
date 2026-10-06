@@ -76,6 +76,8 @@ ESP_RUNS = True
 MAX_FOLD_RUN = 24
 # flags a ``xor reg, reg`` replacement would clobber
 XOR_FLAGS = frozenset({"cf", "of", "zf", "sf", "pf", "af"})
+# ... and the ones an emitted add/sub/and/or/xor/shift would clobber
+_ALU_FLAGS = frozenset({"cf", "of", "zf", "sf", "pf", "af"})
 
 
 # ===========================================================================================
@@ -1187,11 +1189,12 @@ def slice_trace(trace: Trace, regs_out: Sequence[str], keep_unread_stores: bool 
     return stats
 
 
-def _materialize(reg: str, val: T.Term, entry: T.Term | None, xor_ok: bool) -> Instruction | None:
-    """One instruction that turns ``entry`` (the register before the run) into
-    ``val`` (its value after it), or None when no single instruction can.
+def _materialize(reg: str, val: T.Term, entry: T.Term | None, xor_ok: bool, alu_ok: bool,
+                 written: set) -> list[Instruction] | None:
+    """Instructions that turn ``entry`` (the register before the run) into ``val``
+    (its value after it), or None when no simple form exists.
 
-    Two shapes are handled, both of which write state derived from the run's
+    Three shapes are handled, all of which write state derived from the run's
     *entry* state only:
 
     * a constant - ``mov reg, imm32`` (or the 2 byte ``xor reg, reg`` for zero),
@@ -1199,21 +1202,72 @@ def _materialize(reg: str, val: T.Term, entry: T.Term | None, xor_ok: bool) -> I
       keep the rest of the register, so it is emitted when writing the literal
       over ``entry`` yields exactly the run's value.  The entry byte may be
       anything (a loaded byte, a previous blend), it only has to agree with the
-      result *outside* the written field.
+      result *outside* the written field,
+    * an arithmetic chain - a value like ``add(ebx, 0x10)`` becomes
+      ``mov reg, ebx`` / ``add reg, 0x10`` (see :func:`_materialize_alu`); that is
+      what turns ``mov edi, 0x15`` / ``add edi, ebx`` / ``sub edi, 5`` into
+      ``mov edi, 0x10`` / ``add edi, ebx``.
+
+    The caller guarantees the flags: ``xor_ok``/``alu_ok`` say whether the
+    replacement may clobber what ``xor reg, reg`` / an ALU op would write.
     """
     if val.op == "c":
         v = val.args[0]
         if v == 0 and xor_ok:
-            return xor_zero(reg)                       # 2 bytes instead of 5
-        return mov_const(reg, v)
+            return [xor_zero(reg)]                     # 2 bytes instead of 5
+        return [mov_const(reg, v)]
     if val.op == "ins" and entry is not None:
         part, shift = val.args[1], val.args[2]
         if part.op != "c":
             return None
         insn = subreg_mov(reg, part, shift)
         if insn is not None and T.ins(entry, part, shift) is val:
-            return insn
+            return [insn]
+        return None
+    if alu_ok:
+        return _materialize_alu(reg, val, written)
     return None
+
+
+_ALU_OPS = {"add", "sub", "and", "or", "xor", "shl", "shr", "sar"}
+_ALU_MNEMONICS = frozenset({MN.ADD, MN.SUB, MN.AND, MN.OR, MN.XOR, MN.SHL, MN.SHR, MN.SAR})
+
+
+def _materialize_alu(reg: str, val: T.Term, written: set) -> list[Instruction] | None:
+    """``op(other, const)`` - or the non-commutative ``sub(const, other)`` - as a
+    two instruction replacement: ``mov reg, other`` / ``op reg, const``.
+
+    ``other`` has to be a register the run does not write: then it still holds its
+    entry value in the emitted sequence, whatever order the replacements run in, and
+    that value is exactly what the term refers to.
+    """
+    if val.op not in _ALU_OPS or len(val.args) != 2:
+        return None
+    a, b = val.args
+    if a.op == "in" and a.args[0] in REG32 and a.args[0] not in written and b.op == "c":
+        other, const, op = a.args[0], b.args[0], val.op
+    elif val.op == "sub" and a.op == "c" and b.op == "in" and b.args[0] in REG32 \
+            and b.args[0] not in written:
+        other, const, op = b.args[0], a.args[0], "sub"
+    else:
+        return None
+    if op in ("shl", "shr", "sar") and const > 31:
+        return None
+    from .x86asm import alu as _alu, imm as _imm, mov as _mov, reg as _reg, shift as _shift
+    first = _mov(_reg(reg), _reg(other))
+    second = (_shift(op, _reg(reg), _imm(const)) if op in ("shl", "shr", "sar")
+              else _alu(op, _reg(reg), _imm(const)))
+    return [first, second]
+
+
+def _emitted_flags(ins: Instruction) -> frozenset:
+    """The flags a replacement instruction writes (mirrors the lifter's model)."""
+    if ins.mnemonic == MN.XOR and ins.op_count == 2 and ins.op_kind(0) == OK.REGISTER \
+            and ins.op_kind(1) == OK.REGISTER and ins.op_register(0) == ins.op_register(1):
+        return XOR_FLAGS                               # the "xor reg, reg" zero idiom
+    if ins.mnemonic in _ALU_MNEMONICS:
+        return _ALU_FLAGS
+    return frozenset()
 
 
 def _is_fallthrough(s: Step) -> bool:
@@ -1348,6 +1402,8 @@ class _Run:
                 if lo < self.start or hi > j:
                     return None                 # that reader outlives the run
         xor_ok = not (XOR_FLAGS & live_flags)   # ... including the ones "xor reg,reg" would
+        alu_ok = not (_ALU_FLAGS & live_flags)  # ... and the ones an emitted ALU op would
+        written = set(self.final)
         out = []
         for reg, val in self.final.items():
             if reg not in live:
@@ -1355,13 +1411,13 @@ class _Run:
             entry = self.entry.get(reg)
             if val is entry:
                 continue                        # the run leaves the register as it was
-            ins = _materialize(reg, val, entry, xor_ok)
-            if ins is None:
+            insns = _materialize(reg, val, entry, xor_ok, alu_ok, written)
+            if insns is None:
                 return None
-            flags = XOR_FLAGS if ins.mnemonic == MN.XOR else frozenset()
-            out.append((reg, val, ins, flags))
+            flags = frozenset().union(*(_emitted_flags(i) for i in insns))
+            out.append((reg, val, insns, flags))
         ip = self.steps[self.start].ip
-        if len(_encode_instrs([p[2] for p in out], ip)) > self.steps[j].end - ip:
+        if len(_encode_instrs([i for p in out for i in p[2]], ip)) > self.steps[j].end - ip:
             return None                         # the replacement would not fit in the run
         return out
 
@@ -1384,7 +1440,7 @@ def _install(trace: Trace, i: int, j: int, plan: list) -> bool:
     """Apply a fold of the run ``steps[i..j]``, hosted by ``steps[i]``."""
     steps = trace.steps
     host = steps[i]
-    insns = [p[2] for p in plan]
+    insns = [i for p in plan for i in p[2]]
     if insns and j == i and _encode_instrs(insns, host.ip) == _encode_instr(host.ins, host.ip):
         return False                            # same bytes: not worth a rewrite
     note = (f"folded into the run at {host.ip:#x}" if insns
@@ -1404,7 +1460,7 @@ def _install(trace: Trace, i: int, j: int, plan: list) -> bool:
         # must therefore stay in the output
         reads, _ = term_deps([p[1] for p in plan])
         host.reads = frozenset(reads) | frozenset().union(
-            *(_emitted_reads(p[2]) for p in plan))
+            *(_emitted_reads(i) for i in insns))
         host.loads = ()
         host.stores = ()
     # Every step inside the run's bytes must be absorbed, including ones the
