@@ -146,6 +146,25 @@ def test_remote_source_reads_like_the_snapshot():
     assert client.detached
 
 
+def test_an_unreadable_live_read_is_a_clean_stop_not_a_crash():
+    """x64dbg *errors* on an unmapped read; the analysis has to hear "cannot read".
+
+    The discovery follows branch targets, and a stub's dead junk can jump into
+    nowhere (the live VM's handler at 0x1148487 has a target of 0x3c4f876a).  For a
+    snapshot that is an ordinary undecodable target; a live source used to raise
+    the client's RuntimeError straight through the analysis instead.
+    """
+    data = (FIXTURES / "vmcode.bin").read_bytes()
+    client = _LoopbackClient(data[:0x1000], BASE)          # only the first page is mapped
+    remote = RemoteSource(client)
+    with pytest.raises(StubError):
+        remote.read(BASE + 0x1000, 16)
+    # a walk that runs off the mapped pages stops at the edge instead of raising
+    nops = RemoteSource(_LoopbackClient(b"\x90" * 0x40, BASE))
+    res = simplify(nops, BASE, regs_in=[], regs_out=[])
+    assert res.trace.stop is not None
+
+
 def test_patch_bytes_covers_the_whole_stub_and_verifies():
     """The bytes written over a live stub: the code, NOP padded to start..end."""
     data = (FIXTURES / "vmcode.bin").read_bytes()

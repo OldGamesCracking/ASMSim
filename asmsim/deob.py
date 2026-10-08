@@ -151,7 +151,13 @@ class RemoteSource:
         out = bytearray()
         while size:
             n = min(size, 0x1000 - (addr & 0xFFF))
-            chunk = bytes(self.client.read_memory(addr, n))
+            # x64dbg answers an unmapped read with an error, not with nothing - and
+            # "cannot read these bytes" is exactly what the analysis wants to hear
+            # (an unreadable branch target is a dead end, not a crash)
+            try:
+                chunk = bytes(self.client.read_memory(addr, n))
+            except Exception as e:
+                raise StubError(f"cannot read {n} bytes at {addr:#x} ({e})") from None
             if not chunk:
                 raise StubError(f"cannot read {n} bytes at {addr:#x}")
             out += chunk
@@ -164,7 +170,11 @@ class RemoteSource:
         data, off = bytes(data), 0
         while off < len(data):
             n = min(len(data) - off, 0x1000 - ((addr + off) & 0xFFF))
-            if not self.client.write_memory(addr + off, data[off:off + n]):
+            try:
+                ok = self.client.write_memory(addr + off, data[off:off + n])
+            except Exception:
+                return False
+            if not ok:
                 return False
             off += n
         return True
