@@ -11,6 +11,9 @@ a function of the machine state, so it is hooked and given a deterministic,
 monotonic value per run (derived from the seed).  Stubs that read the time stamp
 counter - a favourite of obfuscators - stay comparable, and one that *spins* until
 the counter moves still terminates.
+
+The bits of EFLAGS the symbolic model does not track are pinned to the environment
+that model assumes (TF clear, IF set) - see :meth:`Emu._mask_eflags`.
 """
 from __future__ import annotations
 
@@ -33,6 +36,7 @@ REGS = {"eax": X.UC_X86_REG_EAX, "ecx": X.UC_X86_REG_ECX, "edx": X.UC_X86_REG_ED
         "eip": X.UC_X86_REG_EIP}
 FLAG_BITS = {"cf": 0x1, "pf": 0x4, "af": 0x10, "zf": 0x40, "sf": 0x80, "of": 0x800}
 ALL_FLAGS = sum(FLAG_BITS.values())
+MODELLED_FLAGS = ALL_FLAGS | 0x400          # ... plus df, which the model tracks too
 
 
 class MemError(Exception):
@@ -195,6 +199,18 @@ class Emu:
         self.settle()
         return {n: self.uc.reg_read(r) for n, r in REGS.items()}
 
+    def _mask_eflags(self) -> None:
+        """Keep the model's flags, force the rest to the assumed environment.
+
+        The symbolic side tracks cf/pf/af/zf/sf/df/of and nothing else; whatever a
+        ``popfd`` brings in for the other bits (TF, IF, NT, VM, ...) must not change
+        how the reference run behaves.  See :meth:`step`.
+        """
+        fl = self.uc.reg_read(X.UC_X86_REG_EFLAGS)
+        fixed = (fl & MODELLED_FLAGS) | 0x202               # TF clear, IF set
+        if fixed != fl:
+            self.uc.reg_write(X.UC_X86_REG_EFLAGS, fixed)
+
     def run(self, start: int, until: int, max_insns: int = 200000, count: int = 0) -> None:
         self.write_log.clear()
         self.ensure(start, 1)
@@ -209,6 +225,12 @@ class Emu:
         raises or quietly skips such an instruction; either way it is executed here
         as its stack effect alone, which is what the symbolic model does with it too
         (it ignores selector values entirely).
+
+        The bits of EFLAGS the model does not track are forced to the environment it
+        assumes (``_pack_flags``: TF clear, IF set) after every instruction.  A stub
+        that pops a flags word off uninitialised memory would otherwise run the next
+        instruction with the trap flag set - unicorn raises a debug trap there, and
+        the model has no idea TF exists.
         """
         esp0 = self.uc.reg_read(X.UC_X86_REG_ESP)
         err = None
@@ -216,6 +238,7 @@ class Emu:
             self.uc.emu_start(ip, 0, count=1)
         except UcError as e:
             err = e
+        self._mask_eflags()
         nxt = self.uc.reg_read(X.UC_X86_REG_EIP)
         if err is None and nxt != ip:
             return nxt

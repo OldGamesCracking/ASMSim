@@ -210,6 +210,7 @@ def rsh(x: T.Term, k: int) -> T.Term:
 class Lifter:
     def __init__(self, st: State):
         self.st = st
+        self.flag_defs: set[str] = set()      # flags the current instruction assigns
 
     # -- operand plumbing -----------------------------------------------------------------
     def address(self, ins) -> T.Term:
@@ -252,6 +253,10 @@ class Lifter:
         for name, val in fl.items():
             self.st.flags[name] = val
             self.st.forigin[name] = origin
+            # every flag a handler assigns is a *definition*, whether or not the term
+            # changed: ``and`` setting OF to the 0 that was already there still means
+            # nothing before it can be the definition of OF (see Step.flag_defs)
+            self.flag_defs.add(name)
 
     def zsp(self, res: T.Term):
         return dict(zf=eq(res, const(0, res.bits)), sf=msb(res), pf=par(res))

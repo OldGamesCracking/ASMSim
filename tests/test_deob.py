@@ -1102,6 +1102,55 @@ def test_the_fixture_add_zero_filler_is_gone(src):
     assert not kept & {0x114AA42, 0x114AA43, 0x114AA67, 0x114AA72}
 
 
+def test_a_flag_definition_that_changes_nothing_still_ends_the_search():
+    """``and`` assigning OF := 0 over an OF that already *is* that 0 defines it.
+
+    Same shape as 0x1146E84: ``sbb ebp, imm`` leaves OF at 0 (the model proves the
+    subtraction cannot overflow), then the ``and`` behind it assigns OF := 0 again -
+    the identical term.  Liveness used to be killed only by writes that *change* a
+    term, so an OF read further down tunneled past the ``and`` to the ``sbb`` and
+    kept it - and the ``movzx`` feeding it - alive.
+    """
+    a = _Asm(STUB_BASE)
+    a.op(asm.alu("xor", asm.reg("edi"), asm.reg("edi")))               # OF := 0
+    a.op(asm.alu("and", asm.mem(asm.Mem(disp=P)), asm.reg("eax")))     # store; OF := 0 again
+    a.op(asm.setcc("o", asm.reg("ecx", 8)))                            # reads only OF
+    a.op(_jmp("ebx"))
+    src = _estub(a.build())
+    res = simplify(src, STUB_BASE, regs_in=["eax", "ebx"], regs_out=["ecx"])
+    text = _instructions_only(res)
+    assert "xor edi, edi" not in text        # only OF was live, and the and defines it
+    assert "and [0x600200]" in text          # the store itself stays
+    assert "mov cl, 0" in text               # OF is provably 0, so seto folds to the literal
+    rep = verify(src, res, runs=25)
+    assert rep.ok, str(rep)
+
+
+def test_the_fixture_flag_tunnel_filler_is_gone(src):
+    """0x1146E84: ``movzx ebp, cx`` / ``sbb ebp, 0x4F495F54`` (0x11470F9)."""
+    res = simplify(src, 0x1146E84, regs_in=["ebx"], regs_out=["ebx"])
+    text = _instructions_only(res)
+    assert "sbb ebp" not in text and "movzx ebp" not in text
+
+
+def test_a_popped_trap_flag_does_not_trap_the_reference_run():
+    """The model has no TF, so the emulator must not trap on one either.
+
+    ``push 0x102 / popfd`` sets TF from the stack; unicorn would raise a debug trap
+    on the very next instruction and the run would be thrown away as "skipped" -
+    which is how 0x1146E84 lost half of its verification runs.
+    """
+    a = _Asm(STUB_BASE)
+    a.op(asm.push(asm.imm(0x102)))                    # TF (and IF) from the stack
+    a.op(Instruction.create(Code.POPFD))
+    a.op(asm.mov(asm.reg("eax"), asm.imm(0x1234)))
+    a.op(_jmp("ebx"))
+    src = _estub(a.build())
+    res = simplify(src, STUB_BASE, regs_in=["ebx"], regs_out=["eax"])
+    rep = verify(src, res, runs=25)
+    assert rep.ok and rep.skipped == 0, str(rep)
+
+
 def _repeated_partial_writes(res):
     """Consecutive emitted ``mov <8/16 bit view>, <literal>`` of the same view.
 

@@ -225,6 +225,8 @@ class Step:
     flow: object
     writes: frozenset[str]
     flag_writes: frozenset[str]
+    flag_defs: frozenset[str] = frozenset()   # flags the instruction *assigns* (even
+                                              # when the value is the one already there)
     reads: frozenset[str] = frozenset()
     flag_reads: frozenset[str] = frozenset()
     loads: tuple[Load, ...] = ()
@@ -689,10 +691,12 @@ def _lift_one(st, lifter, ins, ip, raw, memo):
     mem = st.mem
     n_stores = len(mem.stores)
     st.mem.load = recording_load
+    lifter.flag_defs.clear()
     try:
         flow = lifter.step(ins)
     finally:
         del st.mem.load
+    flag_defs = frozenset(lifter.flag_defs)
 
     writes = frozenset(n for n in REG32 if st.regs[n] is not pre_regs[n])
     fwrites = frozenset(n for n in FLAGS if st.flags[n] is not pre_flags[n])
@@ -713,7 +717,7 @@ def _lift_one(st, lifter, ins, ip, raw, memo):
     reads |= areads
     flag_reads |= aflags
     return (flow, pre_regs, pre_flags, writes, fwrites, tuple(loads), new_stores,
-            reads, flag_reads, len(idem))
+            reads, flag_reads, len(idem), flag_defs)
 
 
 # ===========================================================================================
@@ -774,12 +778,13 @@ def _analyse_linear(src, start: int, is_end: Callable[[Instruction], bool] = is_
 
         try:
             (flow, pre_regs, pre_flags, writes, fwrites, loads, new_stores, reads,
-             flag_reads, idem_stores) = _lift_one(st, lifter, ins, ip, raw, memo)
+             flag_reads, idem_stores, flag_defs) = _lift_one(st, lifter, ins, ip, raw, memo)
         except Unsupported as e:
             stop = AnalysisStop(ip, f"unsupported instruction: {e.ins} ({e.why or 'no semantics'})")
             break
 
         step = Step(ins=ins, ip=ip, raw=raw, flow=flow, writes=writes, flag_writes=fwrites,
+                    flag_defs=flag_defs,
                     reads=reads, flag_reads=flag_reads, loads=loads, stores=new_stores,
                     idem_stores=idem_stores,
                     values={n: st.regs[n] for n in writes} | {f: st.flags[f] for f in fwrites},
@@ -1030,10 +1035,11 @@ def _analyse_cfg(src, cfg: _Cfg, is_end, *, concrete, args, mem, max_instruction
         lifter = Lifter(st)
         try:
             (flow, pre_regs, pre_flags, writes, fwrites, loads, new_stores, reads,
-             flag_reads, idem_stores) = _lift_one(st, lifter, ins, node, raw, memo)
+             flag_reads, idem_stores, flag_defs) = _lift_one(st, lifter, ins, node, raw, memo)
         except Unsupported:
             raise _Fallback("unsupported instruction")
         step = Step(ins=ins, ip=node, raw=raw, flow=flow, writes=writes, flag_writes=fwrites,
+                    flag_defs=flag_defs,
                     reads=reads, flag_reads=flag_reads, loads=loads, stores=new_stores,
                     idem_stores=idem_stores,
                     values={n: st.regs[n] for n in writes} | {f: st.flags[f] for f in fwrites},
@@ -1184,7 +1190,7 @@ def slice_trace(trace: Trace, regs_out: Sequence[str], keep_unread_stores: bool 
             keep = False                   # the stack pass proved this dance is invisible
         else:
             keep = (step.force_keep or bool(step.writes & live_regs)
-                    or bool(step.flag_writes & live_flags)
+                    or bool(step.flag_defs & live_flags)
                     or any(id(s) in live_stores for s in step.stores))
         step.kept = keep
         if keep:
@@ -1194,11 +1200,14 @@ def slice_trace(trace: Trace, regs_out: Sequence[str], keep_unread_stores: bool 
                 value_live = True
             else:
                 # standard kill: the instruction overwrites its destinations, so their
-                # previous value is not needed before it (the value *after* it was)
+                # previous value is not needed before it (the value *after* it was).
+                # For the flags that is the *definition* set, not "the term changed":
+                # an ``and`` that assigns OF := 0 over an OF that already *is* that 0
+                # still means no earlier instruction has to define OF.
                 live_regs = (live_regs - step.writes) | step.reads
-                live_flags = (live_flags - step.flag_writes) | step.flag_reads
+                live_flags = (live_flags - step.flag_defs) | step.flag_reads
                 value_live = (bool((step.writes - {"esp"}) & step.live_regs_after)
-                              or bool(step.flag_writes & step.live_flags_after)
+                              or bool(step.flag_defs & step.live_flags_after)
                               or any(id(s) in live_stores for s in step.stores)
                               or ("esp" in step.live_regs_after and step.writes and step.esp_off is None))
             if value_live or (protect_loaded_stores and _load_result_live(step)):
@@ -1532,6 +1541,7 @@ def _install(trace: Trace, i: int, j: int, plan: list) -> bool:
         host.writes = frozenset(p[0] for p in plan)
         host.values = {p[0]: p[1] for p in plan}
         host.flag_writes = frozenset().union(*(p[3] for p in plan))
+        host.flag_defs = host.flag_writes   # the emitted instructions are the definitions
         host.flag_reads = frozenset()
         # what the replacement reads: the dependencies of its values, plus - for a
         # partial write - the register's own bits it merges into, whose producer
@@ -1555,6 +1565,7 @@ def _install(trace: Trace, i: int, j: int, plan: list) -> bool:
         s.esp_dropped = False                   # the host owns the bytes now
         s.reason = note
         s.writes = s.flag_writes = s.reads = s.flag_reads = frozenset()
+        s.flag_defs = frozenset()
         s.stores = s.loads = ()
     return True
 
@@ -1598,7 +1609,7 @@ def _drop_esp_runs(trace: Trace, stats: dict) -> int:
 
     for s in chain:
         essential = (bool((s.writes - {"esp"}) & s.live_regs_after)
-                     or bool(s.flag_writes & s.live_flags_after)
+                     or bool(s.flag_defs & s.live_flags_after)
                      or any(id(x) in live_stores for x in s.stores)
                      or bool(s.kind) or s.force_keep or not _is_fallthrough(s))
         if run and not (len(s.preds) == 1 and s.preds[0] is run[-1]
